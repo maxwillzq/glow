@@ -3105,6 +3105,80 @@ TEST_P(OperatorTest, QuantizedArgMaxNoKeepDim) {
   testArgMaxNoKeepDim<int8_t>(bindings_, mod_, F_, EE_, ElemKind::Int8QTy);
 }
 
+TEST_P(OperatorTest, FloatArgMaxNoKeepDimWithAxis1) {
+  CHECK_IF_ENABLED();
+
+  auto *input = mod_.createPlaceholder(ElemKind::FloatTy, {1, 2, 3, 4}, "input",
+                                       false, "NHWC");
+  auto *argmax =
+      mod_.createPlaceholder(ElemKind::Int64ITy, {1, 3, 4}, "argmax", false);
+
+  bindings_.allocate(input)->getHandle<float>() = {
+      -2.0031254,  1.6150867,  -0.7161922,  -0.25389647, -2.3863597,
+      1.3052065,   -1.2064048, -0.12670185, 1.4289513,   0.38050872,
+      -0.15112245, 1.360533,   -1.9638863,  -0.7602536,  0.68145376,
+      1.1685915,   0.35476854, 1.0272173,   -1.554366,   -1.6835353,
+      -1.4499142,  0.9042695,  1.0751117,   -1.0798755};
+
+  bindings_.allocate(argmax);
+
+  auto *AM =
+      F_->createArgMax("argmax", input, /* axis */ 1, /* keepDims */ false);
+  F_->createSave("save.argmax", AM, argmax);
+
+  EE_.compile(CompilationMode::Infer);
+  EE_.run(bindings_);
+
+  auto I = bindings_.get(argmax)->getHandle<int64_t>();
+  EXPECT_EQ(I.raw(0), 1);
+  EXPECT_EQ(I.raw(1), 0);
+  EXPECT_EQ(I.raw(2), 1);
+  EXPECT_EQ(I.raw(3), 1);
+  EXPECT_EQ(I.raw(4), 1);
+  EXPECT_EQ(I.raw(5), 0);
+  EXPECT_EQ(I.raw(6), 0);
+  EXPECT_EQ(I.raw(7), 0);
+  EXPECT_EQ(I.raw(8), 0);
+  EXPECT_EQ(I.raw(9), 1);
+  EXPECT_EQ(I.raw(10), 1);
+  EXPECT_EQ(I.raw(11), 0);
+}
+
+TEST_P(OperatorTest, FloatArgMaxNoKeepDimWithAxis2) {
+  CHECK_IF_ENABLED();
+
+  auto *input = mod_.createPlaceholder(ElemKind::FloatTy, {1, 2, 3, 4}, "input",
+                                       false, "NHWC");
+  auto *argmax =
+      mod_.createPlaceholder(ElemKind::Int64ITy, {1, 2, 4}, "argmax", false);
+
+  bindings_.allocate(input)->getHandle<float>() = {
+      -0.11289205, -0.13215652, -1.184799,  0.2295995,   0.03064479,
+      -0.28138036, -0.51807016, 0.89983666, -0.46122625, -0.70558083,
+      0.43882176,  -0.6988644,  2.0838234,  -0.22806482, -0.6829437,
+      0.70269305,  -0.8199907,  0.25597557, 0.3598691,   -0.9919779,
+      2.069314,    -1.8825238,  1.2604765,  -0.78306365};
+
+  bindings_.allocate(argmax);
+
+  auto *AM =
+      F_->createArgMax("argmax", input, /* axis */ 2, /* keepDims */ false);
+  F_->createSave("save.argmax", AM, argmax);
+
+  EE_.compile(CompilationMode::Infer);
+  EE_.run(bindings_);
+
+  auto I = bindings_.get(argmax)->getHandle<int64_t>();
+  EXPECT_EQ(I.raw(0), 1);
+  EXPECT_EQ(I.raw(1), 0);
+  EXPECT_EQ(I.raw(2), 2);
+  EXPECT_EQ(I.raw(3), 1);
+  EXPECT_EQ(I.raw(4), 0);
+  EXPECT_EQ(I.raw(5), 1);
+  EXPECT_EQ(I.raw(6), 2);
+  EXPECT_EQ(I.raw(7), 0);
+}
+
 // Check that concatenating Nodes with multiple outputs works correctly.
 TEST_P(OperatorTest, ConcatTopK) {
   CHECK_IF_ENABLED();
@@ -5024,6 +5098,56 @@ TEST_P(OperatorTest, FP16Max) {
   for (size_t idx = 0, end = result.size(); idx != end; ++idx) {
     EXPECT_EQ(result.raw(idx), std::max(handleA.raw(idx), handleB.raw(idx)));
   }
+}
+
+/// Helper to test Broadcast Max/Min using \p DTy and \p NTy
+template <typename DataType, typename NodeType>
+static void testBroadcastMaxMin(glow::PlaceholderBindings &bindings,
+                                glow::Module &mod, glow::Function *F,
+                                glow::ExecutionEngine &EE, ElemKind DTy) {
+
+  auto *inputA = mod.createPlaceholder(DTy, {1, 3, 3, 1}, "A", false);
+  bindings.allocate(inputA)->getHandle<DataType>().randomize(-3.0, 3.0,
+                                                             mod.getPRNG());
+  auto *inputB = mod.createPlaceholder(DTy, {1, 3, 3, 1}, "B", false);
+  bindings.allocate(inputB)->getHandle<DataType>().randomize(-3.0, 3.0,
+                                                             mod.getPRNG());
+
+  Node *maxorMinOp = F->createNodeWithBroadcast<NodeType>(
+      "maxormin", -1 /*axis */, inputA, inputB);
+
+  auto *S = F->createSave("save", maxorMinOp);
+  bindings.allocate(S->getPlaceholder());
+
+  EE.compile(CompilationMode::Infer);
+  EE.run(bindings);
+
+  ASSERT_TRUE(F->verify(&EE.getBackend()))
+      << "Function must pass verification.";
+
+  auto result = bindings.get(S->getPlaceholder())->getHandle<DataType>();
+  auto handleA = bindings.get(inputA)->getHandle<DataType>();
+  auto handleB = bindings.get(inputB)->getHandle<DataType>();
+  ASSERT_EQ(result.size(), handleA.size());
+  for (size_t idx = 0, end = result.size(); idx != end; ++idx) {
+    if (std::is_same<NodeType, MaxNode>::value) {
+      EXPECT_EQ(result.raw(idx), std::max(handleA.raw(idx), handleB.raw(idx)));
+    } else {
+      EXPECT_EQ(result.raw(idx), std::min(handleA.raw(idx), handleB.raw(idx)));
+    }
+  }
+}
+
+TEST_P(OperatorTest, BroadCastMax) {
+  CHECK_IF_ENABLED();
+  testBroadcastMaxMin<int64_t, MaxNode>(bindings_, mod_, F_, EE_,
+                                        ElemKind::Int64ITy);
+}
+
+TEST_P(OperatorTest, BroadCastMin) {
+  CHECK_IF_ENABLED();
+  testBroadcastMaxMin<int64_t, MinNode>(bindings_, mod_, F_, EE_,
+                                        ElemKind::Int64ITy);
 }
 
 TEST_P(OperatorTest, RescaleNode) {
@@ -12261,7 +12385,8 @@ template <typename DataType>
 static void testBatchBoxCox(glow::PlaceholderBindings &bindings,
                             glow::Module &mod, glow::Function *F,
                             glow::ExecutionEngine &EE, ElemKind DTy,
-                            float allowedError = 0.0001f) {
+                            float allowedError = 0.0001f, float maxRange = 5.0f,
+                            float maxLambda2 = 2.0f) {
   // Input tensors.
   const dim_t kRows = 10;
   const dim_t kCols = 5;
@@ -12276,12 +12401,11 @@ static void testBatchBoxCox(glow::PlaceholderBindings &bindings,
   auto lambda2H = bindings.allocate(lambda2)->getHandle<DataType>();
 
   // Fill inputs with random values.
-  dataH.randomize(0.0, 5.0, mod.getPRNG());
+  dataH.randomize(0.0, maxRange, mod.getPRNG());
   lambda1H.randomize(1.0, 2.0, mod.getPRNG());
-  lambda2H.randomize(1.0, 2.0, mod.getPRNG());
+  lambda2H.randomize(1.0, maxLambda2, mod.getPRNG());
 
-  // Zero out every other element to lambda1 to test that case of the
-  // transform.
+  // Zero out every other element to lambda1 to test that case of the transform.
   for (dim_t i = 0; i < kCols; i += 2) {
     lambda1H.at({i}) = 0;
   }
@@ -12334,10 +12458,20 @@ TEST_P(OperatorTest, BatchBoxCox_Float) {
 }
 
 /// Test that the BatchBoxCox operator works as expected in Float16Ty.
-TEST_P(OperatorTest, BatchBoxCox_Float16) {
+TEST_P(OperatorTest, BatchBoxCox_Large_Float16) {
   CHECK_IF_ENABLED();
   testBatchBoxCox<float16_t>(bindings_, mod_, F_, EE_, ElemKind::Float16Ty,
-                             0.01f);
+                             0.032f, 5.0f);
+}
+TEST_P(OperatorTest, BatchBoxCox_Medium_Float16) {
+  CHECK_IF_ENABLED();
+  testBatchBoxCox<float16_t>(bindings_, mod_, F_, EE_, ElemKind::Float16Ty,
+                             0.016f, 3.0f);
+}
+TEST_P(OperatorTest, BatchBoxCox_Small_Float16) {
+  CHECK_IF_ENABLED();
+  testBatchBoxCox<float16_t>(bindings_, mod_, F_, EE_, ElemKind::Float16Ty,
+                             0.003f, 1.0f, 1.001f);
 }
 
 /// Test that Arithmetic ops work.

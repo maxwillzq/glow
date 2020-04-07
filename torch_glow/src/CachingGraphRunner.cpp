@@ -129,6 +129,7 @@ CachingGraphRunner::loadImpl(torch::jit::Stack &stack,
     cctx.precisionConfig.precisionModeKindSet.insert(
         Kinded::Kind::RowwiseQuantizedFullyConnectedNodeKind);
   }
+  cctx.replicationCount = settings_.replicationCount;
 
   if (settings_.dumpFinalGlowGraph) {
     cctx.dumpFinalGraph = true;
@@ -147,6 +148,7 @@ CachingGraphRunner::loadImpl(torch::jit::Stack &stack,
     cctx.backendOpts.backendSpecificOpts.insert(loadBackendSpecificOpts);
   }
 
+  cctx.replicationCount = settings_.replicationCount;
   RETURN_IF_ERR(hostManager_->addNetwork(std::move(module), cctx,
                                          settings_.saturateHost));
 
@@ -200,16 +202,26 @@ Error CachingGraphRunner::runImpl(const PerGlowGraphInfo &info,
       glow::TypeRef ty = ph->getType();
 
       auto ptTensor = input.toTensor();
+      glow::Tensor t;
+
+      bool needClone = false;
 
       if (ptTensor.is_quantized()) {
         ptTensor = convertQuantizedToDtype(ptTensor, at::kQInt8);
+        // We need to clone a new tensor here since
+        // convertQuantizedToDtype might create a temporary tensor
+        needClone = true;
       }
-
-      glow::Tensor t;
       if (!ptTensor.is_contiguous()) {
         ptTensor = ptTensor.contiguous();
+        needClone = true;
       }
-      t = glow::Tensor(ptTensor.data_ptr(), ty).clone();
+
+      if (needClone) {
+        t = glow::Tensor(ptTensor.data_ptr(), ty).clone();
+      } else {
+        t = glow::Tensor(ptTensor.data_ptr(), ty);
+      }
 
       // Write input tesnor to ONNX
       if (settings_.writeToOnnx) {

@@ -712,6 +712,7 @@ static void libjit_arg_max_generic(const T *inW, T2 *outW, const dim_t *inWdims,
   dim_t a, b, c, d = 0;
 
   dim_t *dim[4];
+  assert((axis >= 0) && (axis <= 3) && "Axis values should be between 0 and 3");
   dim[(axis + 1) % 4] = &a;
   dim[(axis + 2) % 4] = &b;
   dim[(axis + 3) % 4] = &c;
@@ -725,7 +726,17 @@ static void libjit_arg_max_generic(const T *inW, T2 *outW, const dim_t *inWdims,
     for (b = 0; b < inWdims[(axis + 2) % 4]; b++) {
       for (c = 0; c < inWdims[(axis + 3) % 4]; c++) {
 
-        T max = inW[libjit_getXYZW(inWdims, *dim[0], *dim[1], *dim[2], 0)];
+        T max = std::numeric_limits<T>::min();
+        if (axis == 0) {
+          max = inW[libjit_getXYZW(inWdims, 0, *dim[1], *dim[2], *dim[3])];
+        } else if (axis == 1) {
+          max = inW[libjit_getXYZW(inWdims, *dim[0], 0, *dim[2], *dim[3])];
+        } else if (axis == 2) {
+          max = inW[libjit_getXYZW(inWdims, *dim[0], *dim[1], 0, *dim[3])];
+        } else {
+          max = inW[libjit_getXYZW(inWdims, *dim[0], *dim[1], *dim[2], 0)];
+        }
+
         dim_t maxi = 0;
 
         // Iterate over argmax axis.
@@ -2663,10 +2674,10 @@ void libjit_write_timestamp(uint64_t *tensor, dim_t offset) {
 }
 
 /// Copies a kernel with type conversion
-void libjit_convertTo_f_b(float *dstPtr, const bool *srcPtr,
-                            const dim_t *dims, dim_t numDims) {
+void libjit_convertTo_f_b(float *dstPtr, const bool *srcPtr, const dim_t *dims,
+                          dim_t numDims) {
   libjit_copy_kernel_with_conversion<float, bool>(dstPtr, srcPtr, dims,
-                                                     numDims);
+                                                  numDims);
 }
 
 void libjit_convertTo_f_i32(float *dstPtr, const int32_t *srcPtr,
