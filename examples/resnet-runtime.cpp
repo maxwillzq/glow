@@ -101,7 +101,7 @@ void dispatchClassify(unsigned int id, HostManager *hostManager,
         EXIT_ON_ERR(std::move(err));
         auto *bindings = context->getPlaceholderBindings();
         size_t maxIdx =
-            bindings->get(bindings->getPlaceholderByName("gpu_0_softmax"))
+            bindings->get(bindings->getPlaceholderByNameSlow("gpu_0_softmax"))
                 ->getHandle()
                 .minMaxArg()
                 .second;
@@ -158,8 +158,8 @@ int main(int argc, char **argv) {
   phList = module->getPlaceholders();
   CompilationContext cctx;
   cctx.backendOpts.autoInstrument = autoInstrument;
-  EXIT_ON_ERR(hostManager->addNetwork(std::move(module), cctx,
-                                      /*saturateHost*/ true));
+  cctx.saturateHost = true;
+  EXIT_ON_ERR(hostManager->addNetwork(std::move(module), cctx));
 
   LOG(INFO) << "Loading files from " << inputDirectory;
   std::error_code code;

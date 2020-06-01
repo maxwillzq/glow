@@ -207,6 +207,11 @@ llvm::cl::opt<bool> glowDumpTrace("glow_dump_debug_traces",
                                   llvm::cl::Optional, llvm::cl::init(false),
                                   llvm::cl::cat(reproTestCat));
 
+llvm::cl::opt<bool> glowEnableDeviceTrace(
+    "glow_enable_device_traces",
+    llvm::cl::desc("Enable trace events from inference backend device."),
+    llvm::cl::Optional, llvm::cl::init(false), llvm::cl::cat(reproTestCat));
+
 llvm::cl::opt<bool> skipCorrectnessCheck(
     "skip_correctness_check", llvm::cl::desc("Skip correctness check"),
     llvm::cl::Optional, llvm::cl::init(false), llvm::cl::cat(reproTestCat));
@@ -420,12 +425,14 @@ int run() {
 
   // Build the execution engine and deserialize the Function.
   auto mod = glow::make_unique<Module>();
-  Function *F = mod->createFunction("test");
   Error err = Error::empty();
   bool usingGlowCustomOps = false;
   CompilationContext cctx;
+  runtime::PrePartitionedConfig PPC;
+  cctx.prepartitionedConfig = &PPC;
   {
-    ONNXModelLoader onnxLD(modelPathOpt, {}, {}, *F, &err, onnxLoaderZipMode,
+    ONNXModelLoader onnxLD(modelPathOpt, {}, {}, *mod, "test", &PPC, &err,
+                           onnxLoaderZipMode,
                            &cctx.backendOpts.backendSpecificNodeInfo);
     usingGlowCustomOps = onnxLD.usingGlowCustomOps();
   }
@@ -433,8 +440,8 @@ int run() {
       << "ONNXModelLoader failed to load model: " << modelPathOpt;
   llvm::outs() << "End onnx model load\n";
 
-  if (glowDumpGraphAfterLoadOpt) {
-    F->dumpDAG("dag.dot");
+  for (Function *F : mod->getFunctions()) {
+    F->dumpDAG(F->getName().str() + ".dot");
   }
 
   // Build host manager and compile the module.
@@ -532,7 +539,8 @@ int run() {
 
   auto hostManager =
       glow::make_unique<runtime::HostManager>(std::move(configs), hostConfig);
-  EXIT_ON_ERR(hostManager->addNetwork(std::move(mod), cctx, glowSaturateHost));
+  cctx.saturateHost = glowSaturateHost;
+  EXIT_ON_ERR(hostManager->addNetwork(std::move(mod), cctx));
 
   // Parse all input and output files ahead of inference.
   std::vector<::ONNX_NAMESPACE::GraphProto> parsedInputs;
@@ -583,20 +591,58 @@ int run() {
   int numTotalInferences = inputGroupSize * itersOpt;
   int numFinishedInferences = 0;
 
+  // Figure out which placeholder is input.
+  std::unordered_set<std::string> inputTensorNames;
+  for (const auto &proto : parsedInputs[0].initializer()) {
+    inputTensorNames.insert(proto.name());
+  }
+
+  glow::PlaceholderList inputPlaceholderList;
+  std::copy_if(placeholderList.begin(), placeholderList.end(),
+               std::back_inserter(inputPlaceholderList),
+               [&](const glow::Placeholder *p) {
+                 return inputTensorNames.find(p->getName()) !=
+                        inputTensorNames.end();
+               });
+
   std::list<InferenceResult> results;
+  std::vector<Tensor> partialTensorPayloads;
+  std::vector<PlaceholderBindings> inputBindings;
+  for (const auto &inputGroup : parsedInputs) {
+    PlaceholderBindings bindings;
+    bindings.allocate(inputPlaceholderList);
+    fillPlaceholders(inputGroup, &bindings,
+                     enablePartialTensor ? &partialTensorPayloads : nullptr,
+                     usingGlowCustomOps);
+    inputBindings.emplace_back(std::move(bindings));
+  }
+
+  // Whether to collect results and check accuracy
+  bool runAccuracyChecks =
+      !skipCorrectnessCheck || topKCompare > 0 || cosineSimilarityStats;
+
+  if (glowDumpTrace && glowEnableDeviceTrace) {
+    // Start device traces.
+    hostManager->setTraceContext(
+        glow::make_unique<TraceContext>(TraceLevel::STANDARD));
+    Error startErr = hostManager->startDeviceTrace();
+    if (ERR_TO_BOOL(std::move(startErr))) {
+      LOG(WARNING) << "Failed to start device traces";
+    }
+  }
 
   auto startTime = std::chrono::steady_clock::now();
   for (int ioIndex = 0, numInferencesIssued = 0;
        numInferencesIssued < numTotalInferences;
        ++numInferencesIssued, ioIndex = numInferencesIssued % inputGroupSize) {
 
-    results.emplace_back(InferenceResult());
+    results.emplace_back();
     auto &result = results.back();
 
-    threadPool.add([&parsedInputs, &nonStaticPlaceholderList, ioIndex,
+    threadPool.add([&inputBindings, &nonStaticPlaceholderList, ioIndex,
                     &mergedTraceContext, &hostManager, &result, &cv, &mutex,
                     numTotalInferences, &numFinishedInferences,
-                    usingGlowCustomOps]() {
+                    runAccuracyChecks]() {
       // Setup the inputs.
       auto ctx = glow::make_unique<ExecutionContext>();
 
@@ -610,21 +656,16 @@ int run() {
       TRACE_EVENT_SCOPE(traceContext, TraceLevel::RUNTIME,
                         "Dispatch to prep input and dispatch");
 
+      // Set up input
       auto &bindings = *ctx->getPlaceholderBindings();
       bindings.clear();
-      bindings.allocate(nonStaticPlaceholderList);
-      const auto &ps = bindings.pairs();
-      for (const auto &kv : ps) {
-        VLOG(1) << "Placeholder allocated: " << kv.first->getName().str();
-      }
 
-      const auto &inputGroup = parsedInputs[ioIndex];
-      // This holds the tensor that actually owns the data for all the partial
-      // inputs.
-      std::vector<Tensor> partialTensorPayloads;
-      fillPlaceholders(inputGroup, &bindings,
-                       enablePartialTensor ? &partialTensorPayloads : nullptr,
-                       usingGlowCustomOps);
+      for (const auto &binding : inputBindings[ioIndex].pairs()) {
+        auto *PH = binding.first;
+        bindings.insert(PH, binding.second.getUnowned());
+      }
+      // Allocate for output
+      bindings.allocate(nonStaticPlaceholderList);
 
       std::promise<void> promise;
       auto future = promise.get_future();
@@ -649,7 +690,7 @@ int run() {
         mergedTraceContext.merge(traceContext);
       }
 
-      if (skipCorrectnessCheck) {
+      if (!runAccuracyChecks) {
         // if skipping correctness check, throw away the context to keep
         // memory usage low.
         result.ctx.reset();
@@ -688,7 +729,7 @@ int run() {
         CHECK(of) << "Cannot create output dump file: " << ss.str();
       }
 
-      if (!skipCorrectnessCheck || topKCompare > 0 || cosineSimilarityStats) {
+      if (runAccuracyChecks) {
         CHECK(result.ctx);
         const auto &bindings = *result.ctx->getPlaceholderBindings();
         for (const auto &tp : outputGroup.initializer()) {
@@ -697,7 +738,7 @@ int run() {
           CHECK(!ERR_TO_BOOL(std::move(error)))
               << "Cannot load output ref tensor";
           const auto *tensor =
-              bindings.get(bindings.getPlaceholderByName(tp.name()));
+              bindings.get(bindings.getPlaceholderByNameSlow(tp.name()));
           CHECK(tensor) << "Missing " << tp.name() << " in output placeholder";
 
           if (cosineSimilarityStats) {
@@ -765,6 +806,15 @@ int run() {
   }
 
   if (glowDumpTrace) {
+    if (glowEnableDeviceTrace) {
+      // Stop device traces and collect events.
+      Error stopErr = hostManager->stopDeviceTrace();
+      if (ERR_TO_BOOL(std::move(stopErr))) {
+        LOG(WARNING) << "Failed to stop device traces.";
+      } else {
+        mergedTraceContext.merge(hostManager->getTraceContext());
+      }
+    }
     llvm::SmallString<64> path;
     if (glowDumpTraceFile.empty()) {
       auto tempFileRes =

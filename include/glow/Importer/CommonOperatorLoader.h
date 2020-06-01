@@ -219,6 +219,15 @@ protected:
     return LengthsMode::Variable;
   }
 
+  inline Expected<float> getAvgLength(ArgumentDictionaryTy &dict) {
+    float avgLength = NAN;
+    if (dict.count("average_lookup_length")) {
+      ASSIGN_VALUE_OR_RETURN_ERR(avgLength,
+                                 loadFloat(dict["average_lookup_length"]));
+    }
+    return avgLength;
+  }
+
   /// Associate the name of operation outputs to a NodeValues corresponding to
   /// node \p node. If \p numOutputs is lower than 0, then all outputs are
   /// associated. Otherwise, the first \p numOutputs outputs are associated.
@@ -383,7 +392,8 @@ protected:
     // softmax function. This is similar to a bitcast operation.
     int axis = 1;
     if (dict.count("axis")) {
-      ASSIGN_VALUE_OR_RETURN_ERR(axis, loadInt(dict["axis"]));
+      ASSIGN_VALUE_OR_RETURN_ERR(axis,
+                                 loadAxis<int>(dict["axis"], in.dims().size()));
     }
 
     auto *FN = G_->createFlatten("reshapeInput", in, axis);
@@ -595,7 +605,8 @@ protected:
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
     size_t axis = 0;
     if (dict.count("axis")) {
-      ASSIGN_VALUE_OR_RETURN_ERR(axis, loadInt(dict["axis"]));
+      ASSIGN_VALUE_OR_RETURN_ERR(
+          axis, loadAxis<size_t>(dict["axis"], in.dims().size()));
     }
 
     std::vector<dim_t> split;
@@ -713,7 +724,8 @@ protected:
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
     int axis = 1;
     if (dict.count("axis")) {
-      ASSIGN_VALUE_OR_RETURN_ERR(axis, loadInt(dict["axis"]));
+      ASSIGN_VALUE_OR_RETURN_ERR(axis,
+                                 loadAxis<int>(dict["axis"], in.dims().size()));
     }
     auto *node = G_->createFlatten(opName, in, axis);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
@@ -723,6 +735,32 @@ protected:
   Error loadIdentity(const OpType &op, ArgumentDictionaryTy &dict) {
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
+
+    // If loading partitioned DAG then check if this identity is used for an
+    // intermediate, and if so create the Save+PH with the correct name.
+    if (partNameToFun_.size()) {
+      int intermediate = 0;
+      if (dict.count("isIntermediateOutputForDAG")) {
+        ASSIGN_VALUE_OR_RETURN_ERR(
+            intermediate, loadInt(dict.at("isIntermediateOutputForDAG")));
+      }
+
+      if (intermediate) {
+        const std::string &opName = loadOperatorName(op);
+        Placeholder *PH = nullptr;
+        if (loadIntoExistingModule_) {
+          PH = mod_.getPlaceholderByNameSlow(op.output(0));
+          RETURN_ERR_IF_NOT(PH, "Did not find intermediate PH" + op.output(0));
+        } else {
+          PH = mod_.createPlaceholder(in.getType(), op.output(0),
+                                      /* isTrainable */ false);
+        }
+        G_->createSave(opName, in, PH, /* skipSuffix */ true);
+        intermediatePHsByName_[op.output(0)] = PH;
+        in = PH->getOutput();
+      }
+    }
+
     nodeValueByName_[op.output(0)] = in;
     return Error::success();
   }
@@ -744,13 +782,11 @@ protected:
       ASSIGN_VALUE_OR_RETURN_ERR(k, loadInt(dict["k"]));
     }
 
-    int axis = -1;
-    if (dict.count("axis")) {
-      ASSIGN_VALUE_OR_RETURN_ERR(axis, loadInt(dict["axis"]));
-    }
     int lastDim = in.dims().size() - 1;
-    if (axis == -1) {
-      axis = lastDim;
+    int axis = lastDim;
+    if (dict.count("axis")) {
+      ASSIGN_VALUE_OR_RETURN_ERR(axis,
+                                 loadAxis<int>(dict["axis"], in.dims().size()));
     }
 
     RETURN_ERR_IF_NOT(axis == lastDim,
@@ -769,7 +805,8 @@ protected:
 
     std::vector<unsigned_t> shapeAxes = {};
     if (dict.count("axes")) {
-      ASSIGN_VALUE_OR_RETURN_ERR(shapeAxes, getShape<unsigned_t>(dict["axes"]));
+      ASSIGN_VALUE_OR_RETURN_ERR(
+          shapeAxes, loadAxes<unsigned_t>(dict["axes"], in.dims().size()));
     } else {
       shapeAxes.resize(in.dims().size());
       std::iota(shapeAxes.begin(), shapeAxes.end(), 0);
@@ -845,8 +882,10 @@ protected:
     ASSIGN_VALUE_OR_RETURN_ERR(in2, getNodeValueByName(op.input(2)));
     LengthsMode lengthsMode;
     ASSIGN_VALUE_OR_RETURN_ERR(lengthsMode, getLengthsMode(dict));
+    float avgLength;
+    ASSIGN_VALUE_OR_RETURN_ERR(avgLength, getAvgLength(dict));
     auto *node = G_->createSparseLengthsSum(loadOperatorName(op), in0, in1, in2,
-                                            lengthsMode);
+                                            lengthsMode, avgLength);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
     return Error::success();
   }
@@ -863,8 +902,10 @@ protected:
     ASSIGN_VALUE_OR_RETURN_ERR(in3, getNodeValueByName(op.input(3)));
     LengthsMode lengthsMode;
     ASSIGN_VALUE_OR_RETURN_ERR(lengthsMode, getLengthsMode(dict));
-    auto *node = G_->createSparseLengthsWeightedSum(loadOperatorName(op), in0,
-                                                    in1, in2, in3, lengthsMode);
+    float avgLength;
+    ASSIGN_VALUE_OR_RETURN_ERR(avgLength, getAvgLength(dict));
+    auto *node = G_->createSparseLengthsWeightedSum(
+        loadOperatorName(op), in0, in1, in2, in3, lengthsMode, avgLength);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
     return Error::success();
   }
@@ -880,9 +921,11 @@ protected:
     ASSIGN_VALUE_OR_RETURN_ERR(in3, getNodeValueByName(op.input(3)));
     LengthsMode lengthsMode;
     ASSIGN_VALUE_OR_RETURN_ERR(lengthsMode, getLengthsMode(dict));
-    auto *node =
-        G_->createEmbeddingBag(loadOperatorName(op), in0, in1, in2, in3,
-                               /* hasEndOffset */ false, lengthsMode);
+    float avgLength;
+    ASSIGN_VALUE_OR_RETURN_ERR(avgLength, getAvgLength(dict));
+    auto *node = G_->createEmbeddingBag(
+        loadOperatorName(op), in0, in1, in2, in3,
+        /* hasEndOffset */ false, lengthsMode, avgLength);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
     return Error::success();
   }
@@ -1041,7 +1084,8 @@ protected:
 
     if (dict.count("axis")) {
       int axis;
-      ASSIGN_VALUE_OR_RETURN_ERR(axis, loadInt(dict.find("axis")->second));
+      ASSIGN_VALUE_OR_RETURN_ERR(
+          axis, loadAxis<int>(dict.find("axis")->second, data.dims().size()));
       if (axis != 0 && axis != 1) {
         RETURN_ERR("Axis must be 0 or 1.");
       }

@@ -27,10 +27,10 @@
 #include "glow/Graph/TensorLayout.h"
 #include "glow/Graph/Utils.h"
 #include "glow/Graph/VerifierHelper.h"
+#include "glow/Optimizer/GraphOptimizer/FunctionPassPipeline.h"
 #include "glow/Optimizer/GraphOptimizer/FunctionPasses.h"
-#include "glow/Optimizer/GraphOptimizer/PassManager.h"
-#include "glow/Optimizer/GraphOptimizerPipeline/Pipeline.h"
 #include "glow/Optimizer/Lower/Lower.h"
+#include "glow/PassManager/PassManager.h"
 #include "glow/Quantization/Base/Base.h"
 #include "glow/Quantization/Quantization.h"
 #include "glow/Runtime/RuntimeTypes.h"
@@ -67,6 +67,35 @@ static bool shouldDeleteNode(Node *N) {
   }
 
   return true;
+}
+
+ConstantModificationPreventer::ConstantModificationPreventer(Module &mod)
+    : ScopeGuard([&]() {
+        // Ensure we cleanup Placeholder-Constant swap if necessary.
+        auto &PHs = mod_.getPlaceholders();
+        for (auto &pair : tmpPHToConstMap_) {
+          Placeholder *tmpPH = pair.first;
+          Constant *C = pair.second;
+          tmpPH->getOutput().replaceAllUsesOfWith(C->getOutput());
+          mod_.erasePlaceholder(std::find(PHs.begin(), PHs.end(), tmpPH));
+        }
+      }),
+      mod_(mod) {
+  // By default dismiss until explicitly activated.
+  dismissed_ = true;
+}
+
+void ConstantModificationPreventer::activate() {
+  dismissed_ = false;
+  // Prevent Constant modification by temporarily replacing them with PHs.
+  for (Constant *C : mod_.getConstants()) {
+    Placeholder *tmpPH = mod_.createPlaceholder(
+        C->getType(), C->getName().str() + "_SWAP_CONST_FOLD",
+        /* isTrainable */ false, C->getLayout());
+    tmpPH->setStatic(true);
+    tmpPHToConstMap_[tmpPH] = C;
+    C->getOutput().replaceAllUsesOfWith(tmpPH->getOutput());
+  }
 }
 
 /// Helper that \returns whether all sibling Functions of \p F (other Functions
@@ -139,9 +168,7 @@ bool DCE::run(Function *F, const CompilationContext &cctx) {
   LOG_SCOPE(F->getLogContext(), getName());
 
   auto &nodes = F->getNodes();
-  auto &consts = F->getParent()->getConstants();
 
-  std::vector<ConstList::iterator> erasedConsts{};
   std::vector<NodesList::iterator> erasedNodes{};
 
   bool changed = false;
@@ -172,11 +199,25 @@ bool DCE::run(Function *F, const CompilationContext &cctx) {
     }
   }
 
+  // Don't remove unused Constants since many may be temporarily unused during
+  // optimizations.
+  if (cctx.optimizationOpts.delayAndRecordConstantModification) {
+    return changed;
+  }
+
   if (!shouldDeleteConstants(F)) {
     return changed;
   }
 
   // Delete unused Constants.
+  deleteUnusedConstants(*F->getParent());
+
+  return changed;
+}
+
+void glow::deleteUnusedConstants(Module &mod) {
+  auto &consts = mod.getConstants();
+  std::vector<ConstList::iterator> erasedConsts{};
   for (auto it = consts.begin(), e = consts.end(); it != e;) {
     if (!shouldDeleteNode(*it)) {
       ++it;
@@ -188,11 +229,9 @@ bool DCE::run(Function *F, const CompilationContext &cctx) {
 
   while (!erasedConsts.empty()) {
     auto it = erasedConsts.back();
-    F->getParent()->eraseConstant(it);
+    mod.eraseConstant(it);
     erasedConsts.pop_back();
   }
-
-  return changed;
 }
 
 /// \returns true if the \p shuffle corresponds to an identity operation, false
@@ -370,7 +409,8 @@ bool SinkConversions::run(Function *F, const CompilationContext &cctx) {
       }
 
       DequantizeNode *newDequantize =
-          F->createDequantize(CN->getName().str() + "_dequantize", newCN);
+          F->createDequantize(CN->getName().str() + "_dequantize", newCN,
+                              CN->getResult().getType());
 
       CN->getResult().replaceAllUsesOfWith(newDequantize->getResult());
       changed = true;
@@ -401,6 +441,47 @@ bool SinkConversions::run(Function *F, const CompilationContext &cctx) {
   return changed;
 }
 
+/// Sink Quantize(Concat(...)) -> Concat(Quantize(...)). This allows for
+/// concatenating less data, and if there are some inputs that are already
+/// quantized and are being dequantized just for the concat then we can skip
+/// this conversion.
+bool SinkConcatBelowQuantize::run(Function *F, const CompilationContext &cctx) {
+  LOG_SCOPE(F->getLogContext(), getName());
+  bool changed = false;
+  auto &nodes = F->getNodes();
+  // For each node:
+  for (auto &N : nodes) {
+    QuantizeNode *QN = dyn_cast<QuantizeNode>(&N);
+    if (!QN) {
+      continue;
+    }
+
+    ConcatNode *CN = dyn_cast<ConcatNode>(QN->getInput());
+    if (!CN || CN->getNumUsers() > 1) {
+      continue;
+    }
+
+    // For all inputs to the current CN, add quantize nodes to them all using
+    // the same scale/offset as QN and put the quantize nodes in newQuantInputs.
+    std::vector<NodeValue> newQuantInputs;
+    for (const NodeValue &inCN : CN->getInputs()) {
+      TypeRef newOutTy = F->getParent()->uniqueTypeWithNewShape(
+          QN->getResult().getType(), inCN.dims());
+      QuantizeNode *quantInCN = F->createQuantize(
+          inCN.getNode()->getName().str() + "_quant", inCN, newOutTy);
+      newQuantInputs.push_back(quantInCN);
+    }
+
+    // Create a new CN with the quantized inputs and replace QN with it.
+    ConcatNode *newCN =
+        F->createConcat(CN->getName(), newQuantInputs, CN->getDim());
+    QN->getResult().replaceAllUsesOfWith(newCN->getResult());
+    changed = true;
+  }
+
+  return changed;
+}
+
 /// Code Sinking.
 bool SinkCode::run(Function *F, const CompilationContext &cctx) {
   LOG_SCOPE(F->getLogContext(), getName());
@@ -409,31 +490,79 @@ bool SinkCode::run(Function *F, const CompilationContext &cctx) {
   // For each node:
   for (auto &N : nodes) {
     auto *node = &N;
-    // Sink Transpose below batch normalization nodes:
-    if (auto *BN = dyn_cast<BatchNormalizationNode>(node)) {
-      auto *TR = dyn_cast<TransposeNode>(BN->getInput());
 
-      if (!TR) {
+    // Sink Reshape/Transpose below BatchNormalization.
+    if (auto *BN = dyn_cast<BatchNormalizationNode>(node)) {
+
+      // Sink Reshape below BatchNormalization.
+      if (auto *RS = dyn_cast<ReshapeNode>(BN->getInput())) {
+        auto inDims = RS->getInput().dims();
+        auto outDims = RS->getResult().dims();
+        unsigned_t newChannelIdx;
+
+        // Skip sinking if the input was less than 3 dimensions, because we need
+        // spatial dimensions in addition to batch and channel.
+        if (RS->getInput().dims().size() < 3) {
+          continue;
+        }
+
+        // Reshape should not change the BatchNorm ChannelIdx dimensions.
+        // Only NH[W]C and NCH[W] are allowed.
+        if (BN->getChannelIdx() == outDims.size() - 1) {
+          if (inDims[inDims.size() - 1] != outDims[outDims.size() - 1]) {
+            continue;
+          }
+          newChannelIdx = inDims.size() - 1;
+        } else if (BN->getChannelIdx() == 1) {
+          // Note: index '1' maps to C in NCH[W] layout.
+          if (inDims[1] != outDims[1]) {
+            continue;
+          }
+          newChannelIdx = 1;
+        } else {
+          continue;
+        }
+
+        // Reshape should not change the batch dimension.
+        if (inDims[0] != outDims[0]) {
+          continue;
+        }
+
+        if (!RS->hasOneUse()) {
+          continue;
+        }
+
+        auto *newBN = F->createBatchNormalization(
+            BN->getName(), RS->getInput(), BN->getBias(), BN->getScale(),
+            BN->getMean(), BN->getVar(), newChannelIdx, BN->getEpsilon(),
+            BN->getMomentum());
+        RS->setNthInput(ReshapeNode::InputIdx, newBN);
+        BN->getResult().replaceAllUsesOfWith(RS);
+        changed = true;
         continue;
       }
 
-      // Figure out where we transposed the channel index for batch
-      // normalization.
-      unsigned_t idx = BN->getChannelIdx();
-      unsigned_t newChannelIdx = TR->getShuffle()[idx];
+      // Sink Transpose below batch normalization nodes:
+      if (auto *TR = dyn_cast<TransposeNode>(BN->getInput())) {
 
-      auto *NewBN = F->createBatchNormalization(
-          BN->getName(), TR->getInput(), BN->getBias(), BN->getScale(),
-          BN->getMean(), BN->getVar(), newChannelIdx, BN->getEpsilon(),
-          BN->getMomentum());
-      NewBN->setPredicate(node->getPredicate());
-      auto *newTR = F->createTranspose(TR->getName(), NewBN, TR->getShuffle(),
-                                       TR->getLayout());
-      newTR->setPredicate(node->getPredicate());
+        // Figure out where we transposed the channel index for batch
+        // normalization.
+        unsigned_t idx = BN->getChannelIdx();
+        unsigned_t newChannelIdx = TR->getShuffle()[idx];
 
-      BN->getResult().replaceAllUsesOfWith(newTR);
-      changed = true;
-      continue;
+        auto *NewBN = F->createBatchNormalization(
+            BN->getName(), TR->getInput(), BN->getBias(), BN->getScale(),
+            BN->getMean(), BN->getVar(), newChannelIdx, BN->getEpsilon(),
+            BN->getMomentum());
+        NewBN->setPredicate(node->getPredicate());
+        auto *newTR = F->createTranspose(TR->getName(), NewBN, TR->getShuffle(),
+                                         TR->getLayout());
+        newTR->setPredicate(node->getPredicate());
+
+        BN->getResult().replaceAllUsesOfWith(newTR);
+        changed = true;
+        continue;
+      }
     }
 
     if (auto *RL = dyn_cast<ReluNode>(node)) {
@@ -1509,6 +1638,12 @@ bool normalizeWeights(Module *M, ConvolutionNode &CV,
     return false;
   }
 
+  // Perform normalization when Convolution layout is NHWC and BatchNorm
+  // ChannelIdx points to C.
+  if (BN.getChannelIdx() != 3) {
+    return false;
+  }
+
   // Set the new filter and bias on CV if necessary.
   if (filterC != CV.getFilter().getNode()) {
     CV.getParent()->getLogContext()->logNodeInputChange(
@@ -2216,10 +2351,19 @@ static NodeValue simplifyConcatNode(Function *F, ConcatNode *CN) {
     // Check if the slices span the input value.
     bool found = findSlicesThatSpanInput(slices, CN->getDim(), order);
     if (found && order.size() == slices.size()) {
+      // Check that the ordered Slices that span the input are in order.
+      bool ordered = true;
+      for (size_t i = 0, e = slices.size(); i < e; i++) {
+        if (order[i] != slices[i]) {
+          ordered = false;
+          break;
+        }
+      }
+
       auto orig = order[0]->getInput();
       // The original value that we extract from must be of the same shape as
       // the concat.
-      if (CN->getResult().getType() == orig.getType()) {
+      if (ordered && CN->getResult().getType() == orig.getType()) {
         return orig;
       }
     }
@@ -2299,6 +2443,105 @@ bool EliminateConcatSlice::run(Function *F, const CompilationContext &cctx) {
       continue;
     }
   }
+  return changed;
+}
+
+/// Eliminate Slice-Concat patterns which are unnecessary. E.g.:
+///            --  NodeSrc ---                               -NodeSrc-
+///          /        |       |                            /          |
+///       SliceA   SliceB   SliceC     ----->           SliceAB       SliceC
+///           \       /      |                             |           |
+/// NodeE  -  ConcatABE       NodeD              NodeE - ConcatABE   NodeD
+bool EliminateSliceConcat::run(Function *F, const CompilationContext &cctx) {
+  LOG_SCOPE(F->getLogContext(), getName());
+  bool changed = false;
+  auto &nodes = F->getNodes();
+
+  for (auto it = nodes.rbegin(), e = nodes.rend(); it != e; it++) {
+    Node &node = *it;
+    auto *CN = dyn_cast<ConcatNode>(&node);
+    if (!CN) {
+      continue;
+    }
+    // avoid 1) merging through operators other than Slices
+    // e.g. Slice(A)-Other-Slice(B), A and B are consecutive
+    // 2) merging Slices from different sources
+    // e.g. Slice(A1)-Slice(B1)-Slice(A2)-Slice(B2), A1 and A2, B1 and B2 are
+    // consecutive respectively
+    std::vector<std::vector<SliceNode *>> consecutiveSlices;
+    std::vector<SliceNode *> currConsecutiveSlices;
+    SliceNode *lastSN = nullptr;
+    for (auto &concatInput : CN->getInputs()) {
+      auto *SN = dyn_cast<SliceNode>(concatInput.getNode());
+      // slices with multiple users will not be considered
+      if (!SN || SN->getResult().getNumUsers() > 1) {
+        if (currConsecutiveSlices.size()) {
+          consecutiveSlices.emplace_back(currConsecutiveSlices);
+          currConsecutiveSlices.clear();
+        }
+        lastSN = nullptr;
+        continue;
+      }
+      // slices with different sources will not be considered
+      if (lastSN && (lastSN->getInput() != SN->getInput() ||
+                     !areSlicesConsecutive(lastSN, SN, CN->getDim()))) {
+        consecutiveSlices.emplace_back(currConsecutiveSlices);
+        currConsecutiveSlices.clear();
+      }
+      lastSN = SN;
+      currConsecutiveSlices.emplace_back(SN);
+    }
+    if (currConsecutiveSlices.size()) {
+      consecutiveSlices.emplace_back(currConsecutiveSlices);
+    }
+
+    // Mapping from old Slices to new Slices where the range of each old Slice
+    // is a subset of the corresponding new Slice
+    std::unordered_map<SliceNode *, SliceNode *> oldToNewSlices;
+    for (const auto &slices : consecutiveSlices) {
+      if (slices.size() <= 1) {
+        continue;
+      }
+      SliceNode *firstSlice = slices.front();
+      auto *srcNode = firstSlice->getInput().getNode();
+      std::vector<dim_t> endDims;
+      for (size_t i = 0, e2 = firstSlice->getResult().dims().size(); i < e2;
+           i++) {
+        endDims.emplace_back(slices.back()->getStart()[i] +
+                             slices.back()->getResult().dims()[i]);
+      }
+      auto *newSlice = F->createSlice(firstSlice->getName(), srcNode,
+                                      firstSlice->getStart(), endDims);
+      for (auto *slice : slices) {
+        oldToNewSlices[slice] = newSlice;
+      }
+      changed = true;
+    }
+    if (!oldToNewSlices.size()) {
+      continue;
+    }
+    // Replace the input Slices to CN with the merged Slices
+    std::vector<NodeValue> newConcatInputs;
+    const SliceNode *lastNewSlice = nullptr;
+    for (const auto &concatInput : CN->getInputs()) {
+      auto *SN = dyn_cast<SliceNode>(concatInput.getNode());
+      if (!SN || !oldToNewSlices.count(SN)) {
+        newConcatInputs.emplace_back(concatInput);
+      } else {
+        auto *newSlice = oldToNewSlices[SN];
+        if (newSlice != lastNewSlice) {
+          lastNewSlice = newSlice;
+          newConcatInputs.emplace_back(newSlice);
+        }
+      }
+    }
+    if (newConcatInputs.size() != CN->getInputs().size()) {
+      auto *newConcat =
+          F->createConcat(CN->getName(), newConcatInputs, CN->getDim());
+      CN->getResult().replaceAllUsesOfWith(newConcat);
+    }
+  }
+
   return changed;
 }
 
@@ -3030,7 +3273,7 @@ static bool isValueChangingCast(TypeRef srcTy, TypeRef destTy) {
 /// Optimize away redundant ClipNodes.
 /// We basically turn "Clip(Clip(Clip(A)))" to "Clip(A)".
 bool OptimizeClips::run(Function *F, const CompilationContext &cctx) {
-  int clipsEliminated = 0;
+  bool changed = false;
   for (Node &node : F->getNodes()) {
     ClipNode *clip = dyn_cast<ClipNode>(&node);
     if (!clip) {
@@ -3045,11 +3288,22 @@ bool OptimizeClips::run(Function *F, const CompilationContext &cctx) {
           F->createClip(clipPrev->getName(), clipPrev->getInput().getNode(),
                         std::max(minPrev, min), std::min(maxPrev, max));
       clip->getResult().replaceAllUsesOfWith(newClip);
-      ++clipsEliminated;
+      changed = true;
+      continue;
+    }
+
+    // We can fold Clip(Relu) -> Clip'
+    if (ReluNode *relu = dyn_cast<ReluNode>(clip->getInput())) {
+      const float newMin = std::max(0.0f, min);
+      ClipNode *newClip = F->createClip(clip->getName().str() + "_relu",
+                                        relu->getInput(), newMin, max);
+      clip->getResult().replaceAllUsesOfWith(newClip->getResult());
+      changed = true;
+      continue;
     }
   }
 
-  return clipsEliminated;
+  return changed;
 }
 
 /// \returns whether \p N used used by any Nodes with side effects.
@@ -3716,7 +3970,8 @@ bool OptimizeQuantization::run(Function *F, const CompilationContext &cctx) {
       // Dequantize(rescale) -> Dequantize()
       if (auto *RS = dyn_cast<RescaleQuantizedNode>(DQ->getInput())) {
         changed = true;
-        auto *newRS = F->createDequantize(DQ->getName(), RS->getInput());
+        auto *newRS = F->createDequantize(DQ->getName(), RS->getInput(),
+                                          DQ->getResult().getType());
         DQ->getResult().replaceAllUsesOfWith(newRS);
 
         // We may be able to optimize this rescale node. Remember to visit
@@ -4427,7 +4682,7 @@ void glow::transformForPrecisionMode(const Backend &B, Function *F,
 
     LOG_SCOPE(F->getLogContext(), "glow::profileQuantization")
 
-    glow::profileQuantization(*cctx.bindings, F);
+    glow::profileQuantization(*cctx.bindings, F, precConfig.profConfig);
     break;
   }
 
@@ -4549,13 +4804,15 @@ Error glow::optimizeFunction(Function *F, const Backend &B,
   // inputs, and outputs (Placeholders and SaveNodes).
   if (cctx.optimizationOpts.foldStaticPlaceholderConversions ||
       cctx.optimizationOpts.foldElemKindConversionIntoIO) {
-    FunctionPassPipeline pipeline{
-        FunctionPassID::FoldElemKindConversionIntoInputs};
+    std::unique_ptr<FunctionPassPipeline> pipeline =
+        glow::make_unique<FunctionPassPipeline>();
+    pipeline->pushBack({FunctionPassID::FoldElemKindConversionIntoInputs});
 
     if (cctx.optimizationOpts.foldElemKindConversionIntoIO) {
-      pipeline.pushBack({FunctionPassID::FoldElemKindConversionIntoOutputs});
+      pipeline->pushBack({FunctionPassID::FoldElemKindConversionIntoOutputs});
     }
-    FunctionPassManager FPM("FoldElemKindConversionIntoIO", pipeline);
+    FunctionPassManager FPM("FoldElemKindConversionIntoIO",
+                            std::move(pipeline));
     if (FPM.run(F, cctx)) {
       ::glow::optimize(F, cctx);
     }
@@ -4582,8 +4839,11 @@ Error glow::optimizeFunction(Function *F, const Backend &B,
 
   // We already started using backend specific verification when the function
   // state became lowered. Do one more verification pass to make sure everything
-  // is in order and to bail if it is not.
-  if (!B.verify(*F, cctx.verboseCompile)) {
+  // is in order and to bail if it is not. Only do so if we are allowing
+  // constant modification, as otherwise we may have prevent a backend from
+  // supporting some Nodes. Expect the caller to verify later on in such cases.
+  if (!cctx.optimizationOpts.delayAndRecordConstantModification &&
+      !B.verify(*F, cctx.verboseCompile)) {
     return MAKE_ERR(
         ErrorValue::ErrorCode::COMPILE_UNSUPPORTED_NODE_AFTER_OPTIMIZE,
         "Unsupported node(s) found after optimizing Function " +

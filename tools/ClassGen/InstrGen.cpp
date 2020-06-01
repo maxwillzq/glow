@@ -49,7 +49,10 @@ int main(int argc, char **argv) {
 
   BB.newInstr("AllocActivation")
       .addMember(MemberType::TypeRef, "Ty")
-      .setType("Ty");
+      .setType("Ty")
+      .addExtraMethod(
+          "void setTy(TypeRef Ty);",
+          "void AllocActivationInst::setTy(TypeRef Ty) { Ty_ = Ty; }");
 
   BB.newInstr("TensorView")
       .addOperand("Src", OperandKind::In)
@@ -97,12 +100,15 @@ int main(int argc, char **argv) {
       .addOperand("Src", OperandKind::In)
       .addOperand("Filter", OperandKind::In)
       .addOperand("Bias", OperandKind::In)
-      .addOperand("Scales", OperandKind::In)
-      .addOperand("Offsets", OperandKind::In)
+      .addOperand("FilterScales", OperandKind::In)
+      .addOperand("FilterOffsets", OperandKind::In)
+      .addOperand("BiasScales", OperandKind::In)
+      .addOperand("BiasOffsets", OperandKind::In)
       .addMember(MemberType::VectorUnsigned, "Kernels")
       .addMember(MemberType::VectorUnsigned, "Strides")
       .addMember(MemberType::VectorUnsigned, "Pads")
       .addMember(MemberType::Unsigned, "Group")
+      .addMember(MemberType::Unsigned, "Dilation")
       .autoIRGen()
       .autoVerify(VerifyKind::SameElementType,
                   {"Dest", "Src", "Filter", "ElemKind::Int8QTy"});
@@ -671,7 +677,8 @@ int main(int argc, char **argv) {
   BB.newInstr("Touch")
       .addOperand("Dest", OperandKind::Out)
       .dataParallel()
-      .autoVerify(VerifyKind::NoVerify);
+      .autoVerify(VerifyKind::NoVerify)
+      .autoIRGen();
 
   BB.newInstr("InsertTensor")
       .addOperand("Dest", OperandKind::InOut)
@@ -733,6 +740,13 @@ int main(int argc, char **argv) {
       .autoVerify(VerifyKind::SameElementType, {"Dest", "Src"})
       .autoIRGen();
 
+  BB.newInstr("ResizeBilinear")
+      .addOperand("Dest", OperandKind::Out)
+      .addOperand("Src", OperandKind::In)
+      .addMember(MemberType::VectorFloat, "Scale")
+      .autoVerify(VerifyKind::SameElementType, {"Dest", "Src"})
+      .autoIRGen();
+
   //===--------------------------------------------------------------------===//
   //                Reorder transformations
   //===--------------------------------------------------------------------===//
@@ -751,6 +765,8 @@ int main(int argc, char **argv) {
 
   BB.newInstr("DebugPrint")
       .addOperand("Src", OperandKind::In)
+      .addMember(MemberType::String, "Format")
+      .addMember(MemberType::String, "FileName")
       .autoVerify(VerifyKind::NoVerify);
 
   BB.newInstr("TraceEvent")
@@ -792,7 +808,6 @@ int main(int argc, char **argv) {
       .addOperand("Src", OperandKind::In)
       .autoVerify(VerifyKind::TypeCheck, {"Dest", "isFPType()"})
       .autoVerify(VerifyKind::TypeCheck, {"Src", "isQuantizedType()"})
-      .autoVerify(VerifyKind::SameShape, {"Dest", "Src"})
       .dataParallel()
       .autoIRGen();
 
@@ -813,7 +828,7 @@ int main(int argc, char **argv) {
       .addOperand("Values", OperandKind::Out)
       .addOperand("Indices", OperandKind::Out)
       .addOperand("Input", OperandKind::In)
-      .addOperand("Scratch", OperandKind::InOut)
+      .addOperand("Scratch", OperandKind::Scratch)
       .addMember(MemberType::Unsigned, "K")
       .autoVerify(VerifyKind::SameElementType, {"Values", "Input"})
       .autoVerify(VerifyKind::SameShape, {"Values", "Indices"});
@@ -839,6 +854,8 @@ int main(int argc, char **argv) {
       .addOperand("TwiddleFactors", OperandKind::In)
       .addOperand("BitReverseIndices", OperandKind::In)
       .addOperand("ComplexToRealWeights", OperandKind::In)
+      .addOperand("WinOutScratch", OperandKind::Scratch)
+      .addOperand("FftOutScratch", OperandKind::Scratch)
       .addMember(MemberType::Int64, "WindowSize")
       .addMember(MemberType::Int64, "WindowStride")
       .addMember(MemberType::Boolean, "MagnitudeSquared")
@@ -855,6 +872,7 @@ int main(int argc, char **argv) {
       .addOperand("MelWeights", OperandKind::In)
       .addOperand("MelRanges", OperandKind::In)
       .addOperand("DctMat", OperandKind::In)
+      .addOperand("Scratch", OperandKind::Scratch)
       .addMember(MemberType::Float, "SampleRate")
       .addMember(MemberType::Float, "LowerFrequency")
       .addMember(MemberType::Float, "UpperFrequency")

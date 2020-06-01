@@ -16,6 +16,7 @@
 
 #include "HostManagerOnnxifi.h"
 #include "glow/Runtime/DeferredWeightLoader.h"
+#include "glow/Runtime/RequestData.h"
 
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
@@ -38,6 +39,7 @@ bool GlowFP16 = false;
 bool GlowFP16Placeholders = true;
 bool GlowFP16Constants = true;
 bool GlowDumpGraph = false;
+bool GlowUseDAGOptimizer = false;
 bool GlowFusedScaleOffsetFP16 = false;
 bool GlowForceSLSAccumFP16 = false;
 bool GlowClipFP16 = false;
@@ -47,6 +49,8 @@ bool GlowSparseNNPartitioningAddSLSConcats = false;
 size_t GlowMaxActiveRequests = 48;
 size_t GlowMaxQueueSize = 100;
 size_t GlowExecutorThreads = 10;
+bool GlowSaveOnnxifiDAG = false;
+bool GlowDelayAndRecordConstantModification = false;
 
 static llvm::cl::opt<int32_t, true>
     GlowNumDevicesOpt("glow-num-devices",
@@ -216,9 +220,22 @@ onnxStatus HostManagerBackend::addNetwork(std::unique_ptr<Module> module,
   if (GlowDumpGraph) {
     cctx.dumpFinalGraph = true;
   }
+  if (GlowUseDAGOptimizer) {
+    LOG(INFO) << "Will call the DAG optimizer.";
+    cctx.callDAGOptimizer = true;
+  }
+  if (GlowSaveOnnxifiDAG) {
+    LOG(INFO) << "Serializing DAG after optimization and partitioning.";
+    cctx.serializeCompiledDAG = true;
+  }
+  if (GlowDelayAndRecordConstantModification) {
+    LOG(INFO) << "Delaying constant modification until after optimizations, "
+                 "including recording constant folding for DAG serialization.";
+    cctx.optimizationOpts.delayAndRecordConstantModification = true;
+  }
+  cctx.saturateHost = GlowSaturateHost;
 
-  auto err =
-      hostManager_->addNetwork(std::move(module), cctx, GlowSaturateHost);
+  auto err = hostManager_->addNetwork(std::move(module), cctx);
 
   if (ERR_TO_BOOL(std::move(err))) {
     return ONNXIFI_STATUS_INTERNAL_ERROR;
@@ -301,9 +318,17 @@ onnxStatus HostManagerGraph::run(std::unique_ptr<ExecutionContext> ctx,
   auto threadId = threads::getThreadId();
   auto startTime = TraceEvent::now();
 
+  auto *data = ::glow::runtime::RequestData::get();
+  std::map<std::string, std::string> attributes;
+  if (data) {
+    attributes["app level request id"] =
+        llvm::formatv("{0}", data->appLevelRequestId);
+  }
+
   backendPtr_->runNetwork(
       this, std::move(ctx),
       [outputEvent, traceEvents, threadId, startTime,
+       attributes = std::move(attributes),
        this](runtime::RunIdentifierTy runId, Error err,
              std::unique_ptr<ExecutionContext> ctx) mutable {
         TRACE_EVENT_SCOPE(ctx->getTraceContext(), TraceLevel::RUNTIME,
@@ -325,11 +350,11 @@ onnxStatus HostManagerGraph::run(std::unique_ptr<ExecutionContext> ctx,
           // threadId. This way, chrome UI will put the async event next to the
           // caller thread.
           traceContext->logTraceEvent("glow e2e", TraceLevel::RUNTIME,
-                                      TraceEvent::AsyncBeginType, startTime, {},
-                                      threadId, runId);
-          traceContext->logTraceEvent(
-              "glow e2e", TraceLevel::RUNTIME, TraceEvent::AsyncEndType,
-              TraceEvent::now(), {}, threads::getThreadId(), runId);
+                                      TraceEvent::BeginType, startTime,
+                                      attributes, threadId, runId);
+          traceContext->logTraceEvent("glow e2e", TraceLevel::RUNTIME,
+                                      TraceEvent::EndType, TraceEvent::now(),
+                                      attributes, threadId, runId);
           setTraceEvents(traceEvents, traceContext);
         }
 

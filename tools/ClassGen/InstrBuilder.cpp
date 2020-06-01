@@ -70,6 +70,11 @@ void InstrBuilder::emitIRBuilderMethods(std::ostream &osH,
 
   // The operands of the instruction class:
   for (const auto &op : operands_) {
+    // Scratch operands are not exposed in the builder method interface
+    // but only in the instruction constructor.
+    if (op.second == OperandKind::Scratch) {
+      continue;
+    }
     osH << ", Value *" << op.first;
     osB << ", Value *" << op.first;
   }
@@ -79,11 +84,23 @@ void InstrBuilder::emitIRBuilderMethods(std::ostream &osH,
     osH << ", " << getStorageTypename(&op.first) << " " << op.second;
     osB << ", " << getStorageTypename(&op.first) << " " << op.second;
   }
-
   osH << ");\n";
+  osB << ") {\n";
+
+  // Create allocations for the scratch operands.
+  for (const auto &op : operands_) {
+    if (op.second == OperandKind::Scratch) {
+      std::string allocSuffix = llvm::StringRef(op.first).lower();
+      osB << "  std::string " << op.first << "Name = name.str() + \"."
+          << allocSuffix << "\";\n";
+      osB << "  auto *" << op.first << "Type = F_->getGraph()->getParent()"
+          << "->uniqueType(ElemKind::Int8QTy, {1}, 0.0, 0);\n";
+      osB << "  auto *" << op.first << " = createAllocActivationInst("
+          << op.first << "Name, " << op.first << "Type);\n";
+    }
+  }
 
   // Initialize the base clases:
-  osB << ") {\n";
   osB << "  auto *A = new " << name_ << "Inst(uniqueName(name)";
 
   // The operands of the instruction class:
@@ -95,6 +112,27 @@ void InstrBuilder::emitIRBuilderMethods(std::ostream &osH,
     osB << ", " << op.second;
   }
   osB << ");\n";
+
+  // Modify allocation sizes based on the instruction requirements.
+  // We allocate at least 1 byte since the memory allocator does not
+  // handle properly allocation sizes of 0.
+  for (const auto &op : operands_) {
+    if (op.second == OperandKind::Scratch) {
+      // A special case is when the instruction already has a member called
+      // "<Operand>Size" for which we allow a different type than dim_t for
+      // flexibility and hence we create a local cast here to dim_t.
+      osB << "  dim_t " << op.first << "SizeVar = static_cast<dim_t>(A->get"
+          << op.first << "Size());\n";
+      osB << "  " << op.first << "SizeVar = " << op.first << "SizeVar > 0 ? "
+          << op.first << "SizeVar : 1;\n";
+      osB << "  auto *" << op.first << "TypeResized = F_->getGraph()"
+          << "->getParent()->uniqueType(ElemKind::Int8QTy, {" << op.first
+          << "SizeVar}, 0.0, 0);\n";
+      osB << "  " << op.first << "->setType(" << op.first << "TypeResized);\n";
+      osB << "  " << op.first << "->setTy(" << op.first << "TypeResized);\n";
+    }
+  }
+
   osB << "  F_->pushInstr(A);\n  return A;\n}\n";
 }
 
@@ -164,6 +202,26 @@ void InstrBuilder::emitSettersGetters(std::ostream &os) const {
     emitMemberGetter(os, &op.first, op.second);
   }
 
+  // Print size getter declarations for scratch operands. The functions will be
+  // manually implemented by the instruction creator.
+  for (const auto &op : operands_) {
+    if (op.second == OperandKind::Scratch) {
+      // A special case is when the instruction already has a member called
+      // "<Operand>Size" for which a getter was already emitted. We detect this
+      // particular case and not emit the getter again.
+      bool hasScratchSizeMember = false;
+      for (const auto &memb : members_) {
+        if (memb.second == (op.first + "Size")) {
+          hasScratchSizeMember = true;
+          break;
+        }
+      }
+      if (!hasScratchSizeMember) {
+        os << "  dim_t get" << op.first << "Size() const;\n";
+      }
+    }
+  }
+
   // Synthesize the 'classof' method that enables the non-rtti polymorphism.
   os << "\n  static bool classof(const Kinded *k) {\n"
      << "    return k->getKind() == Kinded::Kind::" << name_ << "InstKind;\n"
@@ -204,6 +262,16 @@ void InstrBuilder::emitCloner(std::ostream &os) const {
   os << ");\n}\n";
 }
 
+void InstrBuilder::emitGetOperandName(std::ostream &os) const {
+  os << "\nllvm::StringRef " << name_
+     << "Inst::getOperandName(unsigned idx) const {\n";
+  for (size_t i = 0; i < operands_.size(); i++) {
+    os << "  if (idx == " << i << ") { return \"" << operands_[i].first
+       << "\"; }\n";
+  }
+  os << "  llvm_unreachable(\"Invalid index\");\n}\n";
+}
+
 std::string getOpElementType(const std::string &name) {
   const std::string elemKindPrefix = "ElemKind::";
   if (name.substr(0, elemKindPrefix.size()) == elemKindPrefix) {
@@ -225,11 +293,12 @@ void InstrBuilder::emitClass(std::ostream &os) const {
   emitProperties(os);
 
   for (const auto &m : extraMethods_) {
-    os << "  " << m.first << "\n";
+    os << "\n  " << m.first << "\n";
   }
 
   os << "\n  Instruction* clone() const;\n";
   os << "\n  void dump(llvm::raw_ostream &os) const;\n";
+  os << "\n  llvm::StringRef getOperandName(unsigned idx) const;\n";
 
   // If there is no auto-verification then we assume verification is manually
   // provided.
@@ -297,9 +366,10 @@ void InstrBuilder::emitClass(std::ostream &os) const {
 void InstrBuilder::emitCppMethods(std::ostream &os) const {
   emitPrettyPrinter(os);
   emitCloner(os);
+  emitGetOperandName(os);
   // Emit the "extra" method bodies.
   for (const auto &m : extraMethods_) {
-    os << "  " << m.second << "\n";
+    os << "\n" << m.second << "\n";
   }
 }
 
@@ -374,6 +444,11 @@ void InstrBuilder::emitAutoIRGen(std::ostream &os) const {
   llvm::SmallVector<std::pair<std::string, std::string>, 4>
       nodeResultNameToValueName;
   for (const auto &opPair : operands_) {
+    // Skip the scratch operands for this instruction since they are not
+    // registered as node operands.
+    if (opPair.second == OperandKind::Scratch) {
+      continue;
+    }
     if (opPair.second == OperandKind::In) {
       // All inputs of a node were mapped to the glow::Values already.
       // So, just lookup for each input operand it's Value by using the

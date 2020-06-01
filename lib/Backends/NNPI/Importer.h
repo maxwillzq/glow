@@ -96,6 +96,26 @@ public:
   /// Internal name header used for variables.
   static const std::string internalName_;
 
+  /// Check whether a variable name is in the channelwiseConverters_ set.
+  bool hasChannelWiseConverter(const std::string &s) const {
+    return channelwiseConverters_.count(s);
+  }
+
+  /// Add a new (gemmlowp) variable name to the channelwiseConverters_ set.
+  void addChannelWiseConverter(const std::string &s) {
+    channelwiseConverters_.emplace(s);
+  }
+
+  /// Add a path to AI extension (that will be loaded by the inference API).
+  /// Will fail if a file does not exist at this path, validity of the file is
+  /// checked only when the extension is loaded.
+  NNPIErrorCode addIAExtentionPath(const std::string &extPath);
+
+  /// Get AI extension paths.
+  const std::vector<std::string> &getIAExtensionPaths() const {
+    return iaExtensionPaths_;
+  }
+
 private:
   /// Map of named external tensors (inputs, outputs, weights, etc...).
   std::unordered_map<std::string, const Tensor *> constants_;
@@ -117,6 +137,17 @@ private:
       nodeImporters_;
   /// NNPI Device configuration.
   const NNPICompilationOptions &compileOptions_;
+
+  /// This set records all the gemmlowp variables that we created for
+  /// channelwise FC/Conv operator inputs/ouputs. When an variable name appears
+  /// in this set, it means that a (gemmlowp -> symlowp) converter has already
+  /// created. Querying of this can help us create duplicated converters when 1.
+  /// an input is feeding into more than one channelwise ops. 2. an output of
+  /// one channelwise op is consumed by another channelwise op.
+  std::unordered_set<std::string> channelwiseConverters_;
+
+  /// A list of IA extensions that need to be loaded by the device.
+  std::vector<std::string> iaExtensionPaths_;
 };
 
 /// Interface class for all node specific importers.

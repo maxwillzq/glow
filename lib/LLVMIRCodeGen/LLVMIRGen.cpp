@@ -258,11 +258,14 @@ void LLVMIRGen::performCodeGen() {
   auto int8PtrTy = llvm::Type::getInt8PtrTy(getLLVMContext());
   auto dimTPtrTy = llvm::Type::getIntNPtrTy(getLLVMContext(), DIM_T_BITWIDTH);
   // The entry point has the following API:
-  // void entry(uint8_t *baseConstantWeightVars, uint8_t
-  // *baseInoutWeightVars, uint8_t *baseActivations, dim_t *offsets);
-  llvm::Type *voidTy = llvm::Type::getVoidTy(getLLVMContext());
+  // int entry(uint8_t *baseConstantWeightVars,
+  //           uint8_t *baseInoutWeightVars,
+  //           uint8_t *baseActivations,
+  //           dim_t *offsets);
+  llvm::Type *retTy =
+      llvm::Type::getIntNTy(getLLVMContext(), getLibjitIntWidth());
   llvm::FunctionType *jitFuncTy = llvm::FunctionType::get(
-      voidTy, {int8PtrTy, int8PtrTy, int8PtrTy, dimTPtrTy}, false);
+      retTy, {int8PtrTy, int8PtrTy, int8PtrTy, dimTPtrTy}, false);
   llvmF_ = llvm::Function::Create(jitFuncTy, llvm::Function::ExternalLinkage,
                                   "main", llmodule_.get());
   emittedLLVMFunctions_.emplace_back(llvmF_);
@@ -272,7 +275,8 @@ void LLVMIRGen::performCodeGen() {
       llvm::BasicBlock::Create(getLLVMContext(), "entry", llvmF_);
   builder_ = glow::make_unique<llvm::IRBuilder<>>(entry_bb);
   // Terminate the function with a return instruction.
-  auto *ret = builder_->CreateRetVoid();
+  auto zero = builder_->getIntN(getLibjitIntWidth(), 0);
+  auto *ret = builder_->CreateRet(zero);
   // Emit all the code before the retrun instruction.
   builder_->SetInsertPoint(ret);
 
@@ -646,7 +650,8 @@ llvm::Function *LLVMIRGen::getLLVMFunction() { return llvmF_; }
 
 llvm::CallInst *LLVMIRGen::createCall(llvm::IRBuilder<> &builder,
                                       llvm::Function *callee,
-                                      llvm::ArrayRef<llvm::Value *> args) {
+                                      llvm::ArrayRef<llvm::Value *> args,
+                                      bool checked) {
 #ifndef NDEBUG
   llvm::FunctionType *FTy = callee->getFunctionType();
   assert((args.size() == FTy->getNumParams() ||
@@ -659,7 +664,43 @@ llvm::CallInst *LLVMIRGen::createCall(llvm::IRBuilder<> &builder,
            "Calling a function with a bad signature: argument type mismatch.");
   }
 #endif
-  return builder.CreateCall(callee, args);
+  if (!checked || !callee->getReturnType()->isIntegerTy()) {
+    return builder.CreateCall(callee, args);
+  }
+  // Check if callee returned an error, i.e. non-zero result.
+  // Emit a return with this error code in this case.
+  auto *result = builder.CreateCall(callee, args);
+  auto *zero = builder.getIntN(result->getType()->getIntegerBitWidth(), 0);
+  auto *cond = builder.CreateICmpNE(result, zero);
+  auto insertionPoint = builder.GetInsertPoint();
+  auto *currentBB = result->getParent();
+  auto *falseBB =
+      currentBB->splitBasicBlock(builder.GetInsertPoint(), "cont_bb");
+  auto *trueBB = llvm::BasicBlock::Create(getLLVMContext(), "error_bb",
+                                          result->getFunction());
+  builder.SetInsertPoint(currentBB->getTerminator());
+  builder.CreateCondBr(cond, trueBB, falseBB);
+  currentBB->getTerminator()->eraseFromParent();
+  builder.SetInsertPoint(trueBB);
+  auto *castedResult =
+      builder.CreateBitCast(result, builder.getIntNTy(getLibjitIntWidth()));
+  builder.CreateRet(castedResult);
+  builder.SetInsertPoint(falseBB, insertionPoint);
+  builder.SetInsertPoint(falseBB->getTerminator());
+  return result;
+}
+
+llvm::CallInst *
+LLVMIRGen::createCheckedCall(llvm::IRBuilder<> &builder, llvm::Function *callee,
+                             llvm::ArrayRef<llvm::Value *> args) {
+  return createCall(builder, callee, args, /* checked */ true);
+}
+
+llvm::CallInst *
+LLVMIRGen::createUncheckedCall(llvm::IRBuilder<> &builder,
+                               llvm::Function *callee,
+                               llvm::ArrayRef<llvm::Value *> args) {
+  return createCall(builder, callee, args, /* checked */ false);
 }
 
 std::pair<llvm::BasicBlock *, llvm::BasicBlock *>
@@ -788,7 +829,7 @@ void LLVMIRGen::emitDataParallelKernelImpl(
 
   setCurrentDebugLocation(builder, *bundle.begin());
   // Emit a call of the kernel.
-  createCall(builder, kernelFunc, buffers);
+  createUncheckedCall(builder, kernelFunc, buffers);
   // Emit debug info for the generated data-parallel kernel.
   generateFunctionDebugInfo(kernelFunc);
 }
@@ -974,15 +1015,15 @@ void LLVMIRGen::generateLLVMIRForDataParallelInstr(
       TensorQuantizationParams TQP{destTy->getScale(), destTy->getOffset()};   \
       auto quantizedValue = quantization::quantize(value, TQP);                \
       auto *val = emitConstI8(builder, quantizedValue);                        \
-      auto *stackedOpCall =                                                    \
-          createCall(builder, F, {loopCount, val, pointerNull, pointerNull});  \
+      auto *stackedOpCall = createUncheckedCall(                               \
+          builder, F, {loopCount, val, pointerNull, pointerNull});             \
       auto *destAddr = builder.CreateGEP(elementTy, destPtr, loopCount,        \
                                          "buffer.element.addr");               \
       builder.CreateStore(stackedOpCall, destAddr);                            \
     } else {                                                                   \
       auto *val = emitConst(builder, value, dest->getElementType());           \
-      auto *stackedOpCall =                                                    \
-          createCall(builder, F, {loopCount, val, pointerNull, pointerNull});  \
+      auto *stackedOpCall = createUncheckedCall(                               \
+          builder, F, {loopCount, val, pointerNull, pointerNull});             \
       auto *destAddr = builder.CreateGEP(elementTy, destPtr, loopCount,        \
                                          "buffer.element.addr");               \
       builder.CreateStore(stackedOpCall, destAddr);                            \
@@ -1038,7 +1079,7 @@ void LLVMIRGen::generateLLVMIRForDataParallelInstr(
       auto *rhsPost = emitConstI32(builder, rhsScaleParams.post);
       auto *rhsScale = emitConstI32(builder, rhsScaleParams.scale);
 
-      auto *stackedOpCall = createCall(
+      auto *stackedOpCall = createUncheckedCall(
           builder, F,
           {loopCount, condPtr, lhsPtr, rhsPtr, destOffset, lhsOffset, rhsOffset,
            lhsPre, lhsPost, lhsScale, rhsPre, rhsPost, rhsScale});
@@ -1047,7 +1088,7 @@ void LLVMIRGen::generateLLVMIRForDataParallelInstr(
       builder.CreateStore(stackedOpCall, destAddr);
     } else {
       auto *stackedOpCall =
-          createCall(builder, F, {loopCount, condPtr, lhsPtr, rhsPtr});
+          createUncheckedCall(builder, F, {loopCount, condPtr, lhsPtr, rhsPtr});
       auto *destAddr = builder.CreateGEP(builder.getFloatTy(), destPtr,
                                          loopCount, "buffer.element.addr");
       builder.CreateStore(stackedOpCall, destAddr);
@@ -1085,8 +1126,8 @@ void LLVMIRGen::generateLLVMIRForDataParallelInstr(
     auto *elementTy = getElementType(builder, dest);                           \
     auto *pointerNull =                                                        \
         llvm::ConstantPointerNull::get(elementTy->getPointerTo());             \
-    auto *stackedOpCall =                                                      \
-        createCall(builder, F, {loopCount, srcPtr, pointerNull, pointerNull}); \
+    auto *stackedOpCall = createUncheckedCall(                                 \
+        builder, F, {loopCount, srcPtr, pointerNull, pointerNull});            \
     auto *destAddr = builder.CreateGEP(builder.getFloatTy(), destPtr,          \
                                        loopCount, "buffer.element.addr");      \
     builder.CreateStore(stackedOpCall, destAddr);                              \
@@ -1107,7 +1148,7 @@ void LLVMIRGen::generateLLVMIRForDataParallelInstr(
     auto *destPtr = emitBufferAddress(builder, dest, kernel, bufferToArgNum);
     auto *srcPtr = emitBufferAddress(builder, src, kernel, bufferToArgNum);
     auto *F = getFunction("element_is_nan_kernel", src->getElementType());
-    auto *stackedOpCall = createCall(builder, F, {loopCount, srcPtr});
+    auto *stackedOpCall = createUncheckedCall(builder, F, {loopCount, srcPtr});
     auto *elementTy = getElementType(builder, dest);
     auto *destAddr =
         builder.CreateGEP(elementTy, destPtr, loopCount, "buffer.element.addr");
@@ -1126,8 +1167,8 @@ void LLVMIRGen::generateLLVMIRForDataParallelInstr(
     auto *destOffset = emitConstI32(builder, destTy->getOffset());
     auto *F = getFunction("element_quantize_kernel", dest->getElementType());
 
-    auto *stackedOpCall =
-        createCall(builder, F, {loopCount, srcPtr, destScale, destOffset});
+    auto *stackedOpCall = createUncheckedCall(
+        builder, F, {loopCount, srcPtr, destScale, destOffset});
     llvm::Value *destAddr = nullptr;
     if (dest->getElementType() == ElemKind::Int8QTy) {
       destAddr = builder.CreateGEP(builder.getInt8Ty(), destPtr, loopCount,
@@ -1154,8 +1195,8 @@ void LLVMIRGen::generateLLVMIRForDataParallelInstr(
     auto *srcOffset = emitConstI32(builder, srcTy->getOffset());
     auto *F = getFunction("element_dequantize_kernel", dest->getElementType());
 
-    auto *stackedOpCall =
-        createCall(builder, F, {loopCount, srcPtr, srcScale, srcOffset});
+    auto *stackedOpCall = createUncheckedCall(
+        builder, F, {loopCount, srcPtr, srcScale, srcOffset});
     auto *destAddr = builder.CreateGEP(builder.getFloatTy(), destPtr, loopCount,
                                        "buffer.element.addr");
     builder.CreateStore(stackedOpCall, destAddr);
@@ -1182,7 +1223,7 @@ void LLVMIRGen::generateLLVMIRForDataParallelInstr(
     auto *scale = emitConstI32(builder, rescaleParams.scale);
     auto *F = getFunction("element_rescale_kernel", dest->getElementType());
 
-    auto *stackedOpCall = createCall(
+    auto *stackedOpCall = createUncheckedCall(
         builder, F,
         {loopCount, srcPtr, destOffset, srcOffset, preShift, postShift, scale});
     auto *destAddr = builder.CreateGEP(builder.getInt8Ty(), destPtr, loopCount,
@@ -1201,8 +1242,8 @@ void LLVMIRGen::generateLLVMIRForDataParallelInstr(
     auto *elementTy = getElementType(builder, dest);
     auto *pointerNull =
         llvm::ConstantPointerNull::get(elementTy->getPointerTo());
-    auto *stackedOpCall =
-        createCall(builder, F, {loopCount, srcPtr, pointerNull, pointerNull});
+    auto *stackedOpCall = createUncheckedCall(
+        builder, F, {loopCount, srcPtr, pointerNull, pointerNull});
     auto *destAddr = builder.CreateGEP(getElementType(builder, dest), destPtr,
                                        loopCount, "buffer.element.addr");
     builder.CreateStore(stackedOpCall, destAddr);
@@ -1247,16 +1288,16 @@ void LLVMIRGen::generateLLVMIRForDataParallelInstr(
       auto *rhsPost = emitConstI32(builder, rhsScaleParams.post);              \
       auto *rhsScale = emitConstI32(builder, rhsScaleParams.scale);            \
                                                                                \
-      auto *stackedOpCall = createCall(builder, F,                             \
-                                       {loopCount, lhsPtr, rhsPtr, destOffset, \
-                                        lhsOffset, rhsOffset, lhsPre, lhsPost, \
-                                        lhsScale, rhsPre, rhsPost, rhsScale}); \
+      auto *stackedOpCall = createUncheckedCall(                               \
+          builder, F,                                                          \
+          {loopCount, lhsPtr, rhsPtr, destOffset, lhsOffset, rhsOffset,        \
+           lhsPre, lhsPost, lhsScale, rhsPre, rhsPost, rhsScale});             \
       auto *destAddr = builder.CreateGEP(builder.getInt8Ty(), destPtr,         \
                                          loopCount, "buffer.element.addr");    \
       builder.CreateStore(stackedOpCall, destAddr);                            \
     } else {                                                                   \
-      auto *stackedOpCall =                                                    \
-          createCall(builder, F, {loopCount, lhsPtr, rhsPtr, pointerNull});    \
+      auto *stackedOpCall = createUncheckedCall(                               \
+          builder, F, {loopCount, lhsPtr, rhsPtr, pointerNull});               \
       auto *destAddr = builder.CreateGEP(elementTy, destPtr, loopCount,        \
                                          "buffer.element.addr");               \
       builder.CreateStore(stackedOpCall, destAddr);                            \
@@ -1318,14 +1359,16 @@ void LLVMIRGen::generateLLVMIRForDataParallelInstr(
       auto *cmpPost = emitConstI32(builder, scaleParams.post);
       auto *cmpScale = emitConstI32(builder, scaleParams.scale);
 
-      auto *stackedOpCall = createCall(builder, F,
-                                       {loopCount, lhsPtr, rhsPtr, lhsOffset,
-                                        rhsOffset, cmpPre, cmpPost, cmpScale});
+      auto *stackedOpCall =
+          createUncheckedCall(builder, F,
+                              {loopCount, lhsPtr, rhsPtr, lhsOffset, rhsOffset,
+                               cmpPre, cmpPost, cmpScale});
       auto *destAddr = builder.CreateGEP(builder.getInt8Ty(), destPtr,
                                          loopCount, "buffer.element.addr");
       builder.CreateStore(stackedOpCall, destAddr);
     } else {
-      auto *stackedOpCall = createCall(builder, F, {loopCount, lhsPtr, rhsPtr});
+      auto *stackedOpCall =
+          createUncheckedCall(builder, F, {loopCount, lhsPtr, rhsPtr});
       auto *elementTy = getElementType(builder, dest);
       auto *destAddr = builder.CreateGEP(elementTy, destPtr, loopCount,
                                          "buffer.element.addr");
@@ -1348,7 +1391,8 @@ void LLVMIRGen::generateLLVMIRForDataParallelInstr(
     // "data-parallel" kernels in libjit.
     auto *F = getFunction("element_cmp_eq_kernel", lhs->getElementType());
     auto *elementTy = getElementType(builder, dest);
-    auto *stackedOpCall = createCall(builder, F, {loopCount, lhsPtr, rhsPtr});
+    auto *stackedOpCall =
+        createUncheckedCall(builder, F, {loopCount, lhsPtr, rhsPtr});
     auto *destAddr =
         builder.CreateGEP(elementTy, destPtr, loopCount, "buffer.element.addr");
     builder.CreateStore(stackedOpCall, destAddr);
@@ -1390,17 +1434,17 @@ void LLVMIRGen::generateLLVMIRForDataParallelInstr(
       auto *mulScale = emitConstI32(builder, scaleParams.scale);
 
       auto *stackedOpCall =
-          createCall(builder, F,
-                     {loopCount, lhsPtr, rhsPtr, destOffset, lhsOffset,
-                      rhsOffset, mulPre, mulPost, mulScale});
+          createUncheckedCall(builder, F,
+                              {loopCount, lhsPtr, rhsPtr, destOffset, lhsOffset,
+                               rhsOffset, mulPre, mulPost, mulScale});
       auto *destAddr = builder.CreateGEP(builder.getInt8Ty(), destPtr,
                                          loopCount, "buffer.element.addr");
       builder.CreateStore(stackedOpCall, destAddr);
     } else if (lhs->getType()->getElementType() == ElemKind::Int64ITy ||
                lhs->getType()->getElementType() == ElemKind::Int32ITy ||
                lhs->getType()->getElementType() == ElemKind::FloatTy) {
-      auto *stackedOpCall =
-          createCall(builder, F, {loopCount, lhsPtr, rhsPtr, pointerNull});
+      auto *stackedOpCall = createUncheckedCall(
+          builder, F, {loopCount, lhsPtr, rhsPtr, pointerNull});
       auto *destAddr = builder.CreateGEP(elementTy, destPtr, loopCount,
                                          "buffer.element.addr");
       builder.CreateStore(stackedOpCall, destAddr);
@@ -1446,16 +1490,16 @@ void LLVMIRGen::generateLLVMIRForDataParallelInstr(
       auto *divScale = emitConstI32(builder, scaleParams.scale);
 
       auto *stackedOpCall =
-          createCall(builder, F,
-                     {loopCount, lhsPtr, rhsPtr, destOffset, lhsOffset,
-                      rhsOffset, divPre, divPost, divScale});
+          createUncheckedCall(builder, F,
+                              {loopCount, lhsPtr, rhsPtr, destOffset, lhsOffset,
+                               rhsOffset, divPre, divPost, divScale});
       auto *destAddr = builder.CreateGEP(builder.getInt8Ty(), destPtr,
                                          loopCount, "buffer.element.addr");
       builder.CreateStore(stackedOpCall, destAddr);
     } else {
       auto *elementTy = getElementType(builder, dest);
-      auto *stackedOpCall =
-          createCall(builder, F, {loopCount, lhsPtr, rhsPtr, pointerNull});
+      auto *stackedOpCall = createUncheckedCall(
+          builder, F, {loopCount, lhsPtr, rhsPtr, pointerNull});
       auto *destAddr = builder.CreateGEP(elementTy, destPtr, loopCount,
                                          "buffer.element.addr");
       builder.CreateStore(stackedOpCall, destAddr);
@@ -1480,7 +1524,8 @@ void LLVMIRGen::generateLLVMIRForDataParallelInstr(
       F = getFunction("element_modulo_kernel_no_sign_follow",
                       dest->getElementType());
     }
-    auto *stackedOpCall = createCall(builder, F, {loopCount, divisor, srcPtr});
+    auto *stackedOpCall =
+        createUncheckedCall(builder, F, {loopCount, divisor, srcPtr});
     llvm::Value *destAddr = nullptr;
     if (dest->getElementType() == ElemKind::Int64ITy) {
       destAddr = builder.CreateGEP(builder.getInt64Ty(), destPtr, loopCount,
@@ -1499,6 +1544,24 @@ void LLVMIRGen::generateLLVMIRForDataParallelInstr(
     I->dump(s);
     LOG(FATAL) << "Cannot select the instruction: " << s.str();
   }
+}
+
+Tensor LLVMIRGen::getTensorForConstantValue(Value *value) {
+  // Since we can't get the variable from a glow::Value directly,
+  // we need to traverse the var list and find the one matching the given
+  // Value.
+  Tensor tensor;
+  auto *F_ = getIRFunction();
+  for (auto &v : F_->findConstants()) {
+    assert(isa<WeightVar>(F_->getWeightForNode(v)));
+    auto *w = cast<glow::Value>(F_->getWeightForNode(v));
+    if (w == value) {
+      tensor.assign(&v->getPayload());
+      break;
+    }
+  }
+  CHECK(tensor.getUnsafePtr()) << "Can't find the constant value!";
+  return tensor;
 }
 
 void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
@@ -1572,21 +1635,8 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
 
   case Kinded::Kind::RowwiseQuantizedFullyConnectedInstKind: {
     auto *RWQFC = cast<RowwiseQuantizedFullyConnectedInst>(I);
-    // Since we can't get the variable from a glow::Value directly,
-    // we need to traverse the var list and find the one matching the given
-    // Value.
-    Tensor scalesT;
-    auto *F_ = getIRFunction();
-    for (auto &v : F_->findConstants()) {
-      assert(isa<WeightVar>(F_->getWeightForNode(v)));
-      auto *w = cast<glow::Value>(F_->getWeightForNode(v));
-      if (w == RWQFC->getScales()) {
-        scalesT.assign(&v->getPayload());
-        break;
-      }
-    }
-    CHECK(scalesT.getUnsafePtr()) << "Can't find the variable.";
 
+    auto scalesT = getTensorForConstantValue(RWQFC->getScales());
     auto scalesH = scalesT.getHandle();
     size_t rowNum = scalesH.dims()[0];
     float inputScale = RWQFC->getSrc()->getType()->getScale();
@@ -1882,7 +1932,7 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
       // multiplication part of the calculation.
       float matMulScale = srcTy->getScale() * filterTy->getScale();
 
-      // Calculate the sacling parameters for the bias and output.
+      // Calculate the scaling parameters for the bias and output.
       auto biasScaleParam = quantization::quantizeScaleOffset32To8(
           biasTy->getScale() / matMulScale, biasTy->getOffset());
       auto outScaleParam = quantization::quantizeScaleOffset32To8(
@@ -1897,16 +1947,8 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
       auto *outPost = emitConstI32(builder, outScaleParam.post);
       auto *outScale = emitConstI32(builder, outScaleParam.scale);
 
-      llvm::Function *F = nullptr;
-      if ((dest->getElementType() == ElemKind::Int8QTy) &&
-          (bias->getElementType() == ElemKind::Int8QTy)) {
-        F = getFunction("convolution_i8_i8");
-      } else if ((dest->getElementType() == ElemKind::Int8QTy) &&
-                 (bias->getElementType() == ElemKind::Int32QTy)) {
-        F = getFunction("convolution_i8_i32");
-      } else {
-        LOG(FATAL) << "Unsupported element/bias type for ConvolutionInst";
-      }
+      auto *F = getFunction("conv2d",
+                            {dest->getElementType(), bias->getElementType()});
 
       createCall(builder, F,
                  {destPtr,    srcPtr,     filterPtr,  biasPtr,   destDims,
@@ -1916,7 +1958,7 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
                   outPost,    outScale,   unrollD,    dilation});
     } else {
 
-      auto *F = getFunction("convolution", dest->getElementType());
+      auto *F = getFunction("conv2d", dest->getElementType());
 
       createCall(builder, F,
                  {destPtr, srcPtr, filterPtr, biasPtr, destDims, srcDims,
@@ -2019,6 +2061,107 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
                   filterDims, biasDims, kernels, strides, pads, group,
                   dilation});
     }
+    break;
+  }
+
+  case Kinded::Kind::ChannelwiseQuantizedConvolutionInstKind: {
+    auto *CQCI = cast<ChannelwiseQuantizedConvolutionInst>(I);
+    auto *dest = CQCI->getDest();
+    auto *src = CQCI->getSrc();
+    auto *filter = CQCI->getFilter();
+    auto *bias = CQCI->getBias();
+    auto *filterScales = CQCI->getFilterScales();
+    auto *filterOffsets = CQCI->getFilterOffsets();
+    auto *biasScales = CQCI->getBiasScales();
+    auto *biasOffsets = CQCI->getBiasOffsets();
+
+    auto *destTy = dest->getType();
+    auto *srcTy = src->getType();
+
+    auto filterScalesT = getTensorForConstantValue(filterScales);
+    auto filterScalesH = filterScalesT.getHandle<float>();
+
+    auto biasScalesT = getTensorForConstantValue(biasScales);
+    auto biasScalesH = biasScalesT.getHandle<float>();
+
+    // Compute quantization parameters for each channel.
+    auto channelNum = dest->dims().back();
+    std::vector<llvm::Constant *> biasPreV(channelNum);
+    std::vector<llvm::Constant *> biasPostV(channelNum);
+    std::vector<llvm::Constant *> biasScaleV(channelNum);
+    std::vector<llvm::Constant *> outputPreV(channelNum);
+    std::vector<llvm::Constant *> outputPostV(channelNum);
+    std::vector<llvm::Constant *> outputScaleV(channelNum);
+    for (size_t i = 0; i < channelNum; i++) {
+
+      // Compute the scaling parameters for bias and output.
+      float matMulScale = srcTy->getScale() * filterScalesH.raw(i);
+      auto biasScaleParam = quantization::quantizeScaleOffset32To8(
+          biasScalesH.raw(i) / matMulScale, 0);
+      auto outScaleParam = quantization::quantizeScaleOffset32To8(
+          matMulScale / destTy->getScale(), 0);
+
+      // Pass the pre-shift, post-shift and integer scale parameters for the
+      // bias and output calculation.
+      biasPreV[i] = llvm::ConstantInt::get(builder.getInt32Ty(),
+                                           biasScaleParam.pre, true);
+      biasPostV[i] = llvm::ConstantInt::get(builder.getInt32Ty(),
+                                            biasScaleParam.post, true);
+      biasScaleV[i] = llvm::ConstantInt::get(builder.getInt32Ty(),
+                                             biasScaleParam.scale, true);
+      outputPreV[i] =
+          llvm::ConstantInt::get(builder.getInt32Ty(), outScaleParam.pre, true);
+      outputPostV[i] = llvm::ConstantInt::get(builder.getInt32Ty(),
+                                              outScaleParam.post, true);
+      outputScaleV[i] = llvm::ConstantInt::get(builder.getInt32Ty(),
+                                               outScaleParam.scale, true);
+    }
+
+    auto *destPtr = emitValueAddress(builder, dest);
+    auto *srcPtr = emitValueAddress(builder, src);
+    auto *filterPtr = emitValueAddress(builder, filter);
+    auto *biasPtr = emitValueAddress(builder, bias);
+
+    auto *destDims = emitValueDims(builder, dest);
+    auto *srcDims = emitValueDims(builder, src);
+    auto *filterDims = emitValueDims(builder, filter);
+    auto *biasDims = emitValueDims(builder, bias);
+
+    auto *kernels = emitConstDimTArray(builder, CQCI->getKernels());
+    auto *strides = emitConstDimTArray(builder, CQCI->getStrides());
+    auto *pads = emitConstDimTArray(builder, CQCI->getPads());
+    auto *group = emitConstDimT(builder, CQCI->getGroup());
+    auto *dilation = emitConstDimT(builder, CQCI->getDilation());
+
+    auto *destOffset = emitConstI32(builder, destTy->getOffset());
+    auto *srcOffset = emitConstI32(builder, srcTy->getOffset());
+    auto *filterOffsetsPtr = emitValueAddress(builder, filterOffsets);
+    auto *biasOffsetsPtr = emitValueAddress(builder, biasOffsets);
+
+    auto *biasPrePtr = emitConstArray(builder, biasPreV, builder.getInt32Ty());
+    auto *biasPostPtr =
+        emitConstArray(builder, biasPostV, builder.getInt32Ty());
+    auto *biasScalePtr =
+        emitConstArray(builder, biasScaleV, builder.getInt32Ty());
+    auto *outputPrePtr =
+        emitConstArray(builder, outputPreV, builder.getInt32Ty());
+    auto *outputPostPtr =
+        emitConstArray(builder, outputPostV, builder.getInt32Ty());
+    auto *outputScalePtr =
+        emitConstArray(builder, outputScaleV, builder.getInt32Ty());
+
+    bool isConv3D = (srcTy->dims().size() == 5);
+    auto *F = getFunction(isConv3D ? "channelwise_quantized_conv3d"
+                                   : "channelwise_quantized_conv2d",
+                          {dest->getElementType(), bias->getElementType()});
+
+    createCall(builder, F,
+               {destPtr,        srcPtr,        filterPtr,     biasPtr,
+                destDims,       srcDims,       filterDims,    biasDims,
+                kernels,        strides,       pads,          group,
+                dilation,       destOffset,    srcOffset,     filterOffsetsPtr,
+                biasOffsetsPtr, biasPrePtr,    biasPostPtr,   biasScalePtr,
+                outputPrePtr,   outputPostPtr, outputScalePtr});
     break;
   }
 
@@ -2794,12 +2937,48 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
     srcPtr = builder.CreateBitCast(srcPtr, builder.getInt8PtrTy());
     auto *srcDims = emitValueDims(builder, src);
     auto *srcDimsSize = emitConstDimT(builder, src->getType()->dims().size());
+    auto *srcSize = emitConstSizeT(builder, src->getType()->size());
+    auto *srcSizeBytes =
+        emitConstSizeT(builder, src->getType()->getSizeInBytes());
     auto *srcElemKind =
         emitConstDimT(builder, static_cast<size_t>(src->getElementType()));
     auto *name = emitStringConst(builder, I->getName());
+    auto *filename = emitStringConst(builder, DPI->getFileName());
+    auto srcTypeStr = src->getType()->toString();
 
-    auto *F = getFunction("dump_tensor");
-    createCall(builder, F, {srcPtr, srcDims, srcDimsSize, srcElemKind, name});
+    std::string format = DPI->getFormat();
+    if (format == "console") {
+      // Dump tensor in console.
+      auto *F = getFunction("dump_tensor_console");
+      createCall(builder, F, {srcPtr, srcDims, srcDimsSize, srcElemKind, name});
+
+    } else if (format == "bin") {
+      // Dump tensor in file in binary format.
+      auto *F = getFunction("dump_tensor_bin");
+      auto *header = emitStringConst(builder, srcTypeStr);
+      createCall(builder, F, {srcPtr, srcSizeBytes, filename, header});
+
+    } else if (format == "txt") {
+      // Dump tensor in file in text format.
+      auto *F = getFunction("dump_tensor_txt", src->getElementType());
+      auto *header = emitStringConst(builder, srcTypeStr);
+      createCall(builder, F, {srcPtr, srcSize, filename, header});
+
+    } else if (format == "rawbin") {
+      // Dump tensor in file in raw binary format.
+      auto *F = getFunction("dump_tensor_bin");
+      auto *header = emitStringConst(builder, "");
+      createCall(builder, F, {srcPtr, srcSizeBytes, filename, header});
+
+    } else if (format == "rawtxt") {
+      // Dump tensor in file in raw text format.
+      auto *F = getFunction("dump_tensor_txt", src->getElementType());
+      auto *header = emitStringConst(builder, "");
+      createCall(builder, F, {srcPtr, srcSize, filename, header});
+
+    } else {
+      LOG(FATAL) << "Invalid 'Format' attribute for DebugPrint instruction!";
+    }
     break;
   }
 
@@ -2819,16 +2998,29 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
     auto *input = RNI->getSrc();
     auto *resultPtr = emitValueAddress(builder, result);
     auto *inputPtr = emitValueAddress(builder, input);
-    std::vector<float> scaleFloatT;
-    for (auto D : RNI->getScale()) {
-      scaleFloatT.push_back(D);
-    }
 
-    auto *scalePtr =
-        emitConstFloatArray(builder, llvm::makeArrayRef(scaleFloatT));
+    auto *scalePtr = emitConstFloatArray(builder, RNI->getScale());
     auto *destDims = emitValueDims(builder, result);
     auto *srcDims = emitValueDims(builder, input);
     auto *F = getFunction("resizenearest", input->getElementType());
+    createCall(builder, F, {resultPtr, inputPtr, scalePtr, srcDims, destDims});
+    break;
+  }
+
+  case Kinded::Kind::ResizeBilinearInstKind: {
+    auto *RBI = llvm::cast<ResizeBilinearInst>(I);
+    auto *result = RBI->getDest();
+    auto *input = RBI->getSrc();
+    auto *resultPtr = emitValueAddress(builder, result);
+    auto *inputPtr = emitValueAddress(builder, input);
+
+    CHECK_EQ(RBI->getScale()[0], 1.0) << "Scaling batch not supported.";
+    CHECK_EQ(RBI->getScale()[3], 1.0) << "Scaling channel not supported.";
+
+    auto *scalePtr = emitConstFloatArray(builder, RBI->getScale());
+    auto *destDims = emitValueDims(builder, result);
+    auto *srcDims = emitValueDims(builder, input);
+    auto *F = getFunction("resizebilinear", input->getElementType());
     createCall(builder, F, {resultPtr, inputPtr, scalePtr, srcDims, destDims});
     break;
   }
@@ -2875,6 +3067,8 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
 
   case Kinded::Kind::AudioSpectrogramInstKind: {
     auto *ASI = llvm::cast<AudioSpectrogramInst>(I);
+    auto winOutScratch = ASI->getWinOutScratch();
+    auto fftOutScratch = ASI->getFftOutScratch();
     auto spectrogram = ASI->getSpectrogram();
     auto input = ASI->getInput();
     auto window = ASI->getWindow();
@@ -2885,6 +3079,8 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
     int64_t windowStride = ASI->getWindowStride();
     bool magnitudeSquared = ASI->getMagnitudeSquared();
 
+    auto *winOutScratchPtr = emitValueAddress(builder, winOutScratch);
+    auto *fftOutScratchPtr = emitValueAddress(builder, fftOutScratch);
     auto *spectrogramPtr = emitValueAddress(builder, spectrogram);
     auto *inputPtr = emitValueAddress(builder, input);
     auto *windowPtr = emitValueAddress(builder, window);
@@ -2900,15 +3096,16 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
 
     auto *F = getFunction("audio_spectrogram", spectrogram->getElementType());
     createCall(builder, F,
-               {spectrogramPtr, inputPtr, windowPtr, twiddleFactorsPtr,
-                bitReverseIndicesPtr, complexToRealWeightsPtr,
-                spectrogramDimVal, inputLengthVal, windowSizeVal,
-                windowStrideVal, magnitudeSquaredVal});
+               {winOutScratchPtr, fftOutScratchPtr, spectrogramPtr, inputPtr,
+                windowPtr, twiddleFactorsPtr, bitReverseIndicesPtr,
+                complexToRealWeightsPtr, spectrogramDimVal, inputLengthVal,
+                windowSizeVal, windowStrideVal, magnitudeSquaredVal});
     break;
   }
 
   case Kinded::Kind::MFCCInstKind: {
     auto *MFCCI = llvm::cast<MFCCInst>(I);
+    auto scratch = MFCCI->getScratch();
     auto coefficients = MFCCI->getCoefficients();
     auto spectrogram = MFCCI->getSpectrogram();
     auto melWeights = MFCCI->getMelWeights();
@@ -2916,6 +3113,7 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
     auto dctMat = MFCCI->getDctMat();
     int64_t filterBankCount = MFCCI->getFilterBankCount();
 
+    auto *scratchPtr = emitValueAddress(builder, scratch);
     auto *coefficientsPtr = emitValueAddress(builder, coefficients);
     auto *spectrogramPtr = emitValueAddress(builder, spectrogram);
     auto *melWeightsPtr = emitValueAddress(builder, melWeights);
@@ -2927,8 +3125,8 @@ void LLVMIRGen::generateLLVMIRForInstr(llvm::IRBuilder<> &builder,
 
     auto *F = getFunction("mfcc", coefficients->getElementType());
     createCall(builder, F,
-               {coefficientsPtr, spectrogramPtr, melWeightsPtr, melRangesPtr,
-                dctMatPtr, coefficientsDimVal, spectrogramDimVal,
+               {scratchPtr, coefficientsPtr, spectrogramPtr, melWeightsPtr,
+                melRangesPtr, dctMatPtr, coefficientsDimVal, spectrogramDimVal,
                 filterBankCountVal});
     break;
   }
@@ -2969,6 +3167,13 @@ unsigned LLVMIRGen::getLibjitSizeTWidth() const {
   return sizeTVar->getType()->getPointerElementType()->getIntegerBitWidth();
 }
 
+unsigned LLVMIRGen::getLibjitIntWidth() const {
+  auto *intVar = getModule().getGlobalVariable("libjit_intVar",
+                                               /* allowInternal */ true);
+  assert(intVar && "libjit_intVar is not found");
+  return intVar->getType()->getPointerElementType()->getIntegerBitWidth();
+}
+
 bool LLVMIRGen::isEligibleForSpecialization(const llvm::CallInst *call) {
   return true;
 }
@@ -2977,3 +3182,5 @@ bool LLVMIRGen::canBePartOfDataParallelKernel(
     const glow::Instruction *I) const {
   return I->isDataParallel();
 }
+
+std::string LLVMIRGen::getBundleHeaderExtra() const { return ""; }

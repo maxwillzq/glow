@@ -46,7 +46,8 @@ public:
   bool shouldShareBuffers() const override { return false; }
   bool supportsPartialTensors() const override { return true; }
   bool supportsStaticPlaceholders() const override { return true; }
-  FunctionPassPipeline getOptimizationPipeline() const override;
+  std::unique_ptr<FunctionPassPipeline>
+  getOptimizationPipeline() const override;
 
   runtime::DeviceManager *
   createDeviceManager(const runtime::DeviceConfig &deviceConfig) override;
@@ -66,6 +67,10 @@ public:
     NNPIDeviceOptions options({});
     return options.getSupportedOptions();
   };
+
+  virtual Error bindContexts(llvm::ArrayRef<runtime::ContextBinding> bindings,
+                             const runtime::DAGNode *root, bool enableP2P,
+                             bool enableDRT) override;
   /// @}
 
 private:
@@ -78,6 +83,23 @@ private:
   static NNPIBackendOptions backendOptions_;
   static NNPIAdapterContainer adapter_;
 };
+
+/// These are used for parsing backend-specific node options.
+constexpr char numParallelChunksKey[] = "NNPI_numParallelChunks";
+constexpr char parallelTransformKindKey[] = "NNPI_parallelTransformKind";
+constexpr char extraEdgesKey[] = "NNPI_extraEdges";
+constexpr char coreAssignmentsKey[] = "NNPI_coreAssignments";
+
+/// These are used for parsing edge strings in the form of [#$]name[@#]
+struct ExtraEdgeSplitPair {
+  bool hasSplit;
+  std::string label;
+  int splitNum;
+};
+Expected<ExtraEdgeSplitPair>
+getExtraEdgeTargetSplitPair(const std::string &edge);
+Expected<ExtraEdgeSplitPair>
+getExtraEdgeSourceSplitPair(const std::string &edge);
 
 } // namespace glow
 #endif // GLOW_NNPI_BACKEND_H

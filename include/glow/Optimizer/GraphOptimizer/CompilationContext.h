@@ -37,6 +37,9 @@ struct PrecisionConfiguration {
     Profile,  /// Add profiling nodes for quantization statistics gathering.
   } quantMode{QuantizationMode::None};
 
+  /// Configuration for Profiling.
+  quantization::ProfilingConfiguration profConfig;
+
   /// Configuration for Quantization.
   quantization::QuantizationConfiguration quantConfig;
 
@@ -85,6 +88,13 @@ struct OptimizationOptions {
 
   /// If true, perform compile-time computation of constant operations.
   bool enableConstantFolding{true};
+
+  /// If true, before any Function optimization, all the Constants will be
+  /// temporarily replaced by Placeholders, preventing the Constants from being
+  /// modified during the normal optimization pipeline. The original Constants
+  /// will be put back in place automatically afterward, and then Constant
+  /// Folding will be run.
+  bool delayAndRecordConstantModification{false};
 
   /// If true, this will merge ConvertTo and Quantize nodes into inputs and
   /// outputs of the Function. This means modifying the types of Placeholders
@@ -141,12 +151,15 @@ struct CompilationContext {
   /// Allows a loader to store a pre-partitioned config.
   runtime::PrePartitionedConfig *prepartitionedConfig{nullptr};
 
+  /// If true the HostManager will try to use all available devices on the host.
+  bool saturateHost{false};
+
   /// Used during Quantization and Profiling.
   LoweredInfoMap *loweredInfoMap{nullptr};
 
   /// Select whether in Training or Inference mode.
   enum class CompilationMode {
-    Train, /// Compile the graph in preperation for training.
+    Train, /// Compile the graph in preparation for training.
     Infer, /// Compile the graph for inference. Notice that this operation
            /// changes the graph in a way that is not reversible.
     NumCompilationModes, /// Used to count the number of CompilationModes.
@@ -189,6 +202,12 @@ struct CompilationContext {
   /// user-defined partitioning.
   unsigned replicationCount{1};
 
+  /// Whether to serialize the DAG that has been optimized and partitioned.
+  bool serializeCompiledDAG{false};
+
+  /// Whether to call the DAG optimizer after the DAG is created in HostManager.
+  bool callDAGOptimizer{false};
+
   CompilationContext(PlaceholderBindings *bindings_ = nullptr,
                      LoweredInfoMap *loweredInfoMap_ = nullptr)
       : bindings(bindings_), loweredInfoMap(loweredInfoMap_) {}
@@ -225,6 +244,16 @@ struct CompilationContext {
     case QuantizationMode::None:
       break;
     }
+
+    RETURN_ERR_IF_NOT(!(optimizationOpts.foldElemKindConversionIntoIO &&
+                        optimizationOpts.delayAndRecordConstantModification),
+                      "Cannot currently perform elem kind merging into PHs "
+                      "when also preventing constant modification.");
+
+    RETURN_ERR_IF_NOT(!(serializeCompiledDAG &&
+                        !optimizationOpts.delayAndRecordConstantModification),
+                      "When serializing the compiled DAG, must also enable "
+                      "delayAndRecordConstantModification.");
 
     return Error::success();
   }

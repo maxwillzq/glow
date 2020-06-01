@@ -30,7 +30,8 @@ namespace runtime {
 class NetworkExecutionState final {
 public:
   /// Constructor.
-  explicit NetworkExecutionState(const DAGNode *root);
+  explicit NetworkExecutionState(const DAGNode *root, bool enableDRT,
+                                 bool enableP2P);
 
   const DAGNode *getRoot() { return root_; }
 
@@ -103,6 +104,12 @@ private:
   /// The callback that should be called when execution is done.
   ResultCBTy cb_;
 
+  /// Whether Device Resident Tensors optimization is enabled for the state.
+  bool enableDRT_;
+
+  /// Whether Peer to Peer optimization is enabled for the state.
+  bool enableP2P_;
+
   /// The ExecutionContext object containing the results of the execution
   /// (i.e. the outputs of the DAGNodes that have no children).
   std::unique_ptr<ExecutionContext> resultCtx_;
@@ -131,10 +138,23 @@ private:
   /// free buffers.
   std::unordered_map<void *, DeviceManager *> deviceAllocations_;
 
-  /// Map of intermediate placeholder bindings that need to be pointed at
-  /// resultCtx tensors.
-  std::unordered_map<Placeholder *, std::vector<PlaceholderBindings *>>
-      externalIntermediates_;
+  /// A vector of vector of placeholder map iterators indicating the binding
+  /// relationship between the external inputs to the inputs of each DAGNode
+  /// (partition). For example, externalPlaceholders_[i] contains two elements.
+  /// It means, i-th extenral input will be fed into two partitions, and each
+  /// element points to the Placeholder map in each partition which needs their
+  /// backing tensor to be updated at each inference time.
+  std::vector<std::vector<PlaceholderBindings::PlaceholderMap::iterator>>
+      externalPlaceholders_;
+
+  /// Auxiliary index mapping. ioIdxMapping_[i] mapping the placeholder from
+  /// i-th ExternalIOBindings from the resultCtx_ to
+  /// externalPlaceholders_[ioIdxMapping_[i]].
+  std::vector<int> ioIdxMapping_;
+
+  /// Mapping of a placeholder to its position in externalPlaceholders_.
+  std::unordered_map<Placeholder *, int> externalPlaceholdersIdx_;
+
   /// Input contexts for all of the nodes. These are gradually
   /// populated as a node's parents finish.
   std::unordered_map<const DAGNode *, std::unique_ptr<ExecutionContext>>

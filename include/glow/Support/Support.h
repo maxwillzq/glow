@@ -157,6 +157,14 @@ const std::string strFormat(const char *format, ...)
 #endif
 ;
 
+/// Printf-like formatting for std::string. The returned string lives until the
+/// end of the program execution.
+const std::string &staticStrFormat(const char *format, ...)
+#ifndef _MSC_VER
+    __attribute__((__format__(__printf__, 1, 2)));
+#endif
+;
+
 /// Helper that converts and \returns an enum class to an unsigned. Useful when
 /// using an enum class in a bitset.
 template <class T> inline constexpr unsigned convertEnumToUnsigned(T e) {
@@ -204,6 +212,69 @@ constexpr char sepChar = ':';
 
 /// Convert a string to int. \returns the int or Error if problem parsing.
 Expected<int> getIntFromStr(llvm::StringRef input);
+
+/// A helper type for creating compile-time strings.
+template <char... letters> struct string_t {
+  static char const *str() {
+    static constexpr char string[] = {letters..., '\0'};
+    return string;
+  }
+};
+
+/// Reorder vector \p v according to the indices in \p order. Value at index
+/// idx in \p v will end up at the position indicated by the value in \p order
+/// at index idx.
+template <class T>
+void vectorReorder(std::vector<T> &v, std::vector<size_t> const &order) {
+  for (int s = 1, d; s < order.size(); ++s) {
+    for (d = order[s]; d < s; d = order[d])
+      ;
+    if (d == s)
+      while (d = order[d], d != s) {
+        std::swap(v[s], v[d]);
+      }
+  }
+}
+
+/// Simple scope guard implementation.
+class ScopeGuard {
+  /// Function to call when the destructor is called.
+  std::function<void()> endFun_;
+
+protected:
+  /// Whether the guard has been dismissed.
+  bool dismissed_{false};
+
+public:
+  /// Ctor that takes the function to call in destructor.
+  ScopeGuard(std::function<void()> &&fun)
+      : endFun_(std::move(fun)), dismissed_(false) {}
+
+  /// Make not copyable.
+  ScopeGuard(const ScopeGuard &) = delete;
+
+  /// Make not assignable.
+  ScopeGuard &operator=(const ScopeGuard &) = delete;
+
+  /// Dtor that calls \ref endFun_ if \ref dismissed_.
+  ~ScopeGuard() {
+    if (!dismissed_) {
+      endFun_();
+    }
+  }
+
+  /// Disables the guard.
+  void dismiss() { dismissed_ = true; }
+
+  /// Runs the function for the guard and dismissed. If already dismissed then
+  /// this is a no-op.
+  void runAndDismiss() {
+    if (!dismissed_) {
+      endFun_();
+      dismiss();
+    }
+  };
+};
 
 } // namespace glow
 

@@ -28,6 +28,12 @@
 /// Options.
 extern llvm::cl::OptionCategory loaderCat;
 
+/// Number of devices to use.
+extern llvm::cl::opt<unsigned> numDevices;
+
+/// Whether to run all inputs on all numDevices. Used for testing.
+extern llvm::cl::opt<bool> runAllInputsOnAllDevices;
+
 /// Timer option used to indicate if inferences should be timed -time.
 extern llvm::cl::opt<bool> timeOpt;
 /// Iterations used to indicate the number of iterations to run an inferece
@@ -58,7 +64,7 @@ public:
   /// Called once after ONNX or Caffe2 model loading.
   virtual void postModelLoad(Loader &, PlaceholderBindings &, ProtobufLoader &,
                              llvm::StringMap<Placeholder *> &,
-                             size_t compilationBatchSize) = 0;
+                             TypeRef inputImageType) = 0;
   /// Called once at the beginning of the mini-batch inference.
   virtual void inferInitMiniBatch(Loader &, PlaceholderBindings &,
                                   size_t minibatchIndex,
@@ -172,8 +178,7 @@ public:
   Loader &registerExtension(std::unique_ptr<LoaderExtension> ext);
   /// Called once after ONNX or Caffe2 model loading.
   void postModelLoad(PlaceholderBindings &bindings, ProtobufLoader &protoLoader,
-                     llvm::StringMap<Placeholder *> &,
-                     size_t compilationBatchSize);
+                     llvm::StringMap<Placeholder *> &, TypeRef inputImageType);
   /// Called at the beginning of each mini-batch inference.
   void inferInitMiniBatch(PlaceholderBindings &bindings, size_t minibatchIndex,
                           size_t minibatchSize);
@@ -187,8 +192,10 @@ public:
   /// include quantization profile guided information.
   void generateAndSerializeProfilingInfos(PlaceholderBindings &bindings);
 
-  /// Create the Loader driver object.
-  Loader();
+  /// Create the Loader driver object. If \p configDeviceIDs is empty then \ref
+  /// numDevices DeviceConfigs are created for each device, otherwise
+  /// configDeviceIDs is used to create DeviceConfigs with specified IDs.
+  Loader(llvm::ArrayRef<size_t> configDeviceIDs = {});
 };
 
 } // namespace glow

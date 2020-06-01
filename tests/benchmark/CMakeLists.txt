@@ -71,6 +71,28 @@ target_link_libraries(Int8GemmParallelBench
                         HostManager
                         CPURuntimeNative)
 
+add_executable(Int8Conv2dParallelBench
+               Int8Conv2dParallelBench.cpp)
+target_link_libraries(Int8Conv2dParallelBench
+                      PRIVATE
+                        Backends
+                        ExecutionEngine
+                        Graph
+                        GraphOptimizer
+                        HostManager
+                        CPURuntimeNative)
+
+add_executable(Int8Conv3dParallelBench
+               Int8Conv3dParallelBench.cpp)
+target_link_libraries(Int8Conv3dParallelBench
+                      PRIVATE
+                        Backends
+                        ExecutionEngine
+                        Graph
+                        GraphOptimizer
+                        HostManager
+                        CPURuntimeNative)
+
 add_executable(BatchGemmBench
                BatchGemmBench.cpp)
 target_link_libraries(BatchGemmBench
@@ -92,6 +114,18 @@ target_link_libraries(TransposeBench
                         GraphOptimizer
                         HostManager
                         CPURuntimeNative)
+
+add_executable(ConcatBench
+               ConcatBench.cpp)
+target_link_libraries(ConcatBench
+                      PRIVATE
+                        Backends
+                        ExecutionEngine
+                        Graph
+                        GraphOptimizer
+                        HostManager
+                        CPURuntimeNative)
+
 
 add_executable(BERTProxyLayerBench
                BERTProxyLayerBench.cpp)

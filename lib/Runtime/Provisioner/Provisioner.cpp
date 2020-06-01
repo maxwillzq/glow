@@ -224,6 +224,37 @@ Provisioner::generateDeviceAssignments(
   return deviceAssignment;
 }
 
+/// Updates \p allNodeInfo for all Nodes in \p newF given Nodes in \p oldF using
+/// mapping \p oldToNewMap. Copies the final new info added from \p allNodeInfo
+/// into \p origAllNodeInfo.
+static Error propagateBackendSpecificNodeInfo(
+    Function *oldF, Function *newF,
+    const llvm::DenseMap<const Node *, Node *> &oldToNewMap,
+    BackendSpecificNodeInfo &allNodeInfo,
+    BackendSpecificNodeInfo &origAllNodeInfo) {
+  // If there's no old node info for oldF then just return early.
+  if (!allNodeInfo.count(oldF)) {
+    return Error::success();
+  }
+
+  const auto &oldFunInfo = allNodeInfo[oldF];
+  auto &newFunInfo = allNodeInfo[newF];
+
+  for (const auto &oldNodeInfo : oldFunInfo) {
+    const Node *oldN = oldNodeInfo.first;
+    const auto oldToNewIt = oldToNewMap.find(oldN);
+    RETURN_ERR_IF_NOT(oldToNewIt != oldToNewMap.end(), "No old node in map");
+    const Node *newN = oldToNewIt->second;
+    newFunInfo[newN] = oldNodeInfo.second;
+  }
+
+  // Copy into the original info for this Function, since allNodeInfo is from a
+  // local copy of backendOpts we made in the caller to provision this Function.
+  origAllNodeInfo[newF] = newFunInfo;
+
+  return Error::success();
+}
+
 Error Provisioner::provision(DAGListTy &networks, Module &module,
                              CompilationContext &cctx) {
 
@@ -368,14 +399,6 @@ Error Provisioner::provision(DAGListTy &networks, Module &module,
                               deviceBackendName);
         }
 
-        if (cctx.dumpFinalGraph) {
-          auto fname =
-              strFormat("final_graph_%s_%s.dot", deviceBackendName.c_str(),
-                        function->getName().str().c_str());
-          LOG(INFO) << "Dumping final graph to " << fname;
-          function->dumpDAG(fname);
-        }
-
         std::unordered_map<std::string, std::unique_ptr<glow::CompiledFunction>>
             compiledReplications;
         // Before we compile clone the function so we can replicate it on the
@@ -383,7 +406,12 @@ Error Provisioner::provision(DAGListTy &networks, Module &module,
         for (unsigned i = 1; i < node->replicationCount; i++) {
           std::string replicatedName =
               getReplicatedName(function->getName(), i);
-          auto clonedFunction = function->clone(replicatedName);
+          llvm::DenseMap<const Node *, Node *> oldToNewMap;
+          auto *clonedFunction = function->clone(replicatedName, &oldToNewMap);
+          RETURN_IF_ERR(propagateBackendSpecificNodeInfo(
+              function, clonedFunction, oldToNewMap,
+              options.backendSpecificNodeInfo,
+              cctx.backendOpts.backendSpecificNodeInfo));
           auto compiledOrErr2 =
               backends_[deviceBackendName]->compile(clonedFunction, options);
           if (!compiledOrErr2) {
@@ -397,6 +425,16 @@ Error Provisioner::provision(DAGListTy &networks, Module &module,
 
         auto compiledOrErr =
             backends_[deviceBackendName]->compile(function, options);
+
+        // Note: This needs to come after compile above because compile may
+        // modify the Function as well.
+        if (cctx.dumpFinalGraph) {
+          auto fname =
+              strFormat("final_graph_%s_%s.dot", deviceBackendName.c_str(),
+                        function->getName().str().c_str());
+          LOG(INFO) << "Dumping final graph to " << fname;
+          function->dumpDAG(fname);
+        }
 
         if (GlowDumpCompilationLog) {
           llvm::SmallString<64> path;
@@ -515,13 +553,15 @@ Error Provisioner::provision(DAGListTy &networks, Module &module,
   if (cctx.deferredWeightLoader) {
     LOG(INFO) << "Loading deferred weights";
 
+    auto startTime = std::chrono::steady_clock::now();
     auto loader = cctx.deferredWeightLoader;
     // Load the first weight.
     RETURN_IF_ERR(loader->loadNextWeight());
     std::string weightName = loader->getName();
     // Load weights while there are weights to be loaded.
     while (weightName != "") {
-      auto PH = module.getPlaceholderByName(weightName);
+      LOG(INFO) << "Loading " << weightName;
+      const auto PH = module.getPlaceholderByNameSlow(weightName);
       if (!PH) {
         return MAKE_ERR(ErrorValue::ErrorCode::RUNTIME_ERROR,
                         llvm::formatv("Error loading deferred weight. Name: "
@@ -546,19 +586,29 @@ Error Provisioner::provision(DAGListTy &networks, Module &module,
           weight->convertToType(newK);
         }
       }
-
       // Transfer weight to all devices needed.
+      std::list<Error> errors;
+      std::list<std::future<void>> futures;
       for (const auto &device : placeholderToDeviceManager[PH]) {
         std::promise<void> transferPromise;
-        Error transferError = Error::empty();
-        auto done = transferPromise.get_future();
+        errors.emplace_back(Error::empty());
+        futures.emplace_back(transferPromise.get_future());
         devices_[device]->transferStaticPlaceholderToDevice(
-            PH, weight, [&transferPromise, &transferError](Error err) {
-              transferError = std::move(err);
+            PH, weight,
+            [&transferPromise, &error = errors.back()](Error err) mutable {
+              error = std::move(err);
               transferPromise.set_value();
             });
-        RETURN_IF_ERR(transferError);
       }
+
+      for (auto &done : futures) {
+        done.get();
+      }
+
+      for (auto &error : errors) {
+        RETURN_IF_ERR(error);
+      }
+
       RETURN_IF_ERR(loader->loadNextWeight());
       weightName = loader->getName();
       // Remove PH from map, this way we can know that we've added all static
@@ -569,6 +619,11 @@ Error Provisioner::provision(DAGListTy &networks, Module &module,
       return MAKE_ERR(ErrorValue::ErrorCode::RUNTIME_ERROR,
                       "Error not all static placeholders were initialized.");
     }
+
+    std::chrono::duration<double> duration =
+        std::chrono::steady_clock::now() - startTime;
+    LOG(INFO) << "Done loading deferred weights in " << duration.count()
+              << " seconds";
   }
   // Init alternate name states.
   for (auto &network : networks) {

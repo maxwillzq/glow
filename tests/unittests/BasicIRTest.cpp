@@ -169,7 +169,7 @@ static IRFunction *createTestIRFunction(Module &mod) {
     builder.createTensorView(ElemKind::FloatTy, {1, 24, 3, 24}, I2, "I2_view");
     builder.createInsertTensorInst("", I6, I3, {0, 0, 0, 0}, 1, 0);
     builder.createElementMulInst("", I1, I0, I0);
-    builder.createDebugPrintInst("", I0);
+    builder.createDebugPrintInst("", I0, "console", "");
     builder.createQuantizationProfileInst("", I0, B0, ComputationInfo);
   }
   return M;
@@ -348,5 +348,40 @@ TEST(IR, InstUniqueNames) {
     EXPECT_TRUE(it.second);
 
     M.verify();
+  }
+}
+
+TEST(IR, getOperandName) {
+  Module mod;
+  Function *F = mod.createFunction("main");
+  IRFunction M(F);
+  {
+    IRBuilder bb(&M);
+
+    auto *input = bb.createWeightVar(ElemKind::FloatTy, {1, 224, 224, 3});
+    auto *res = bb.createAllocActivationInst("sigmoid.res", input->getType());
+    auto *sig = bb.createSigmoidInst("sigmoid", res, input);
+    auto *pool =
+        bb.createAvgPoolOp(sig->getDest(), {7, 7}, {2, 2}, {3, 3, 3, 3}, NHWC);
+
+    EXPECT_EQ(pool->getNumOperands(), 2);
+    EXPECT_EQ(pool->getOperandName(0), "Dest");
+    EXPECT_EQ(pool->getOperandName(1), "Src");
+  }
+}
+
+/// Check that Scratch is allocated properly for instructions.
+TEST(IR, scratchAllocation) {
+  Module mod;
+  Function *F = mod.createFunction("main");
+  IRFunction M(F);
+  {
+    IRBuilder bb(&M);
+    auto *input = bb.createWeightVar(ElemKind::FloatTy, {10});
+    TopKInst *topk = bb.createTopKOp("topk", input, 3, ElemKind::Int64ITy);
+    // Verify scratch is allocated and has correct size.
+    auto *scratch = topk->getScratch();
+    EXPECT_TRUE(isa<AllocActivationInst>(scratch));
+    EXPECT_EQ(scratch->getType()->size(), topk->getScratchSize());
   }
 }

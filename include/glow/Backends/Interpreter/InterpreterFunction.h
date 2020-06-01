@@ -202,6 +202,16 @@ private:
                                                  Value *scalesV,
                                                  Value *offsetsV);
 
+  template <typename ElemTy, typename AccumulatorTy,
+            typename BiasElemTy = int32_t>
+  void fwdChannelwiseQuantizedConv2DInstImpl(
+      const ChannelwiseQuantizedConvolutionInst *I);
+
+  template <typename ElemTy, typename AccumulatorTy,
+            typename BiasElemTy = int32_t>
+  void fwdChannelwiseQuantizedConv3DInstImpl(
+      const ChannelwiseQuantizedConvolutionInst *I);
+
   void fwdElementAddInstI8Impl(const ElementAddInst *I);
   template <typename ElemTy>
   void fwdElementAddInstArithmeticImpl(const ElementAddInst *I);
@@ -225,6 +235,9 @@ private:
 
   template <typename ElemTy>
   void fwdResizeNearestInstImpl(const ResizeNearestInst *I);
+
+  template <typename ElemTy>
+  void fwdResizeBilinearInstImpl(const ResizeBilinearInst *I);
 
   template <typename ElemTy> void fwdSigmoidInstFloatImpl(const SigmoidInst *I);
 

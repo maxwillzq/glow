@@ -15,18 +15,21 @@
 
 #include "NNPI.h"
 #include "DebugMacros.h"
+#include "InferenceContext.h"
 #include "NNPICompiledFunction.h"
 #include "NNPIDeviceManager.h"
+#include "NNPIUtils.h"
 #include "glow/Graph/Nodes.h"
 #include "glow/Graph/Utils.h"
+#include "glow/Optimizer/GraphOptimizer/FunctionPassPipeline.h"
 #include "glow/Optimizer/GraphOptimizer/GraphOptimizer.h"
-#include "glow/Optimizer/GraphOptimizerPipeline/Pipeline.h"
 #include "glow/Optimizer/Lower/Lower.h"
 
-#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/CommandLine.h"
 
 #include <fstream>
+#include <unordered_map>
+#include <unordered_set>
 
 using namespace glow;
 
@@ -52,6 +55,42 @@ static llvm::cl::opt<bool, /* ExternalStorage */ true>
             "Whether to accept unary SLS ops during ONNXIFI loading."),
         llvm::cl::location(GlowNNPIAcceptUnarySLS), llvm::cl::Optional,
         llvm::cl::init(false), llvm::cl::cat(optionsForNNPI));
+
+/// Parse a string with format either "# .. splitChar .. label" or "label ..
+/// splitChar .. #". If splitChar is not found then return the original string
+/// as label.
+Expected<ExtraEdgeSplitPair>
+getExtraEdgeSourceSplitPair(const std::string &edge, char splitChar,
+                            bool labelPrecedesNum) {
+  ExtraEdgeSplitPair splitPair;
+  llvm::StringRef edgeRef(edge);
+  if (edgeRef.contains(splitChar)) {
+    auto splitEdge = edgeRef.split(splitChar);
+    if (labelPrecedesNum) {
+      std::swap(splitEdge.first, splitEdge.second);
+    }
+    RETURN_ERR_IF_NOT(splitEdge.first != "", "Edge must have an integer value");
+    ASSIGN_VALUE_OR_RETURN_ERR(splitPair.splitNum,
+                               getIntFromStr(std::string(splitEdge.first)));
+    splitPair.label = splitEdge.second.str();
+    splitPair.hasSplit = true;
+  } else {
+    splitPair.label = edge;
+    splitPair.splitNum = 0;
+    splitPair.hasSplit = false;
+  }
+  return splitPair;
+}
+
+Expected<ExtraEdgeSplitPair>
+getExtraEdgeTargetSplitPair(const std::string &edge) {
+  return getExtraEdgeSourceSplitPair(edge, '@', true);
+}
+
+Expected<ExtraEdgeSplitPair>
+getExtraEdgeSourceSplitPair(const std::string &edge) {
+  return getExtraEdgeSourceSplitPair(edge, '$', false);
+}
 
 namespace onnxifi {
 
@@ -195,7 +234,8 @@ bool NNPIBackend::isOpSupported(const NodeInfo &NI) const {
     }
     return NI.allInputsAndOutputsHaveSameElemKind({ElemKind::Int8QTy},
                                                   {ConvolutionNode::BiasIdx}) &&
-           (NI.getInElemTy(ConvolutionNode::BiasIdx) == ElemKind::Int32QTy);
+           ((NI.getInElemTy(ConvolutionNode::BiasIdx) == ElemKind::Int32QTy) ||
+            (NI.getInElemTy(ConvolutionNode::BiasIdx) == ElemKind::FloatTy));
 
   case Kinded::Kind::Convolution3DNodeKind:
     if (!NI.getInTy(Convolution3DNode::InputIdx)->isQuantizedType()) {
@@ -204,7 +244,9 @@ bool NNPIBackend::isOpSupported(const NodeInfo &NI) const {
     }
     return NI.allInputsAndOutputsHaveSameElemKind(
                {ElemKind::Int8QTy}, {Convolution3DNode::BiasIdx}) &&
-           (NI.getInElemTy(Convolution3DNode::BiasIdx) == ElemKind::Int32QTy);
+           ((NI.getInElemTy(Convolution3DNode::BiasIdx) ==
+             ElemKind::Int32QTy) ||
+            (NI.getInElemTy(ConvolutionNode::BiasIdx) == ElemKind::FloatTy));
   case Kinded::Kind::QuantizeNodeKind:
     return (NI.getInElemTy(QuantizeNode::InputIdx) == ElemKind::FloatTy ||
             NI.getInElemTy(QuantizeNode::InputIdx) == ElemKind::Float16Ty) &&
@@ -235,13 +277,15 @@ bool NNPIBackend::isOpSupported(const NodeInfo &NI) const {
   }
 
   case Kinded::Kind::FullyConnectedNodeKind:
-    if (!NI.getInTy(ConvolutionNode::InputIdx)->isQuantizedType()) {
+    if (!NI.getInTy(FullyConnectedNode::InputIdx)->isQuantizedType()) {
       return NI.allInputsAndOutputsHaveSameElemKind(
           {ElemKind::FloatTy, ElemKind::Float16Ty});
     }
     return NI.allInputsAndOutputsHaveSameElemKind(
                {ElemKind::Int8QTy}, {FullyConnectedNode::BiasIdx}) &&
-           (NI.getInElemTy(FullyConnectedNode::BiasIdx) == ElemKind::Int32QTy);
+           ((NI.getInElemTy(FullyConnectedNode::BiasIdx) ==
+             ElemKind::Int32QTy) ||
+            (NI.getInElemTy(FullyConnectedNode::BiasIdx) == ElemKind::FloatTy));
 
   case Kinded::Kind::MaxPoolNodeKind:
     return NI.allInputsAndOutputsHaveSameElemKind(
@@ -306,8 +350,10 @@ bool NNPIBackend::isOpSupported(const NodeInfo &NI) const {
             ElemKind::FloatTy) &&
            (NI.getInElemTy(RowwiseQuantizedFullyConnectedNode::OffsetsIdx) ==
             ElemKind::Int32ITy) &&
-           (NI.getInElemTy(RowwiseQuantizedFullyConnectedNode::BiasIdx) ==
-            ElemKind::Int32QTy) &&
+           ((NI.getInElemTy(RowwiseQuantizedFullyConnectedNode::BiasIdx) ==
+             ElemKind::Int32QTy) ||
+            (NI.getInElemTy(RowwiseQuantizedFullyConnectedNode::BiasIdx) ==
+             ElemKind::FloatTy)) &&
            (NI.getOutElemTy(RowwiseQuantizedFullyConnectedNode::ResultIdx) ==
             ElemKind::Int8QTy);
 
@@ -316,11 +362,16 @@ bool NNPIBackend::isOpSupported(const NodeInfo &NI) const {
             ElemKind::Int8QTy) &&
            (NI.getInElemTy(ChannelwiseQuantizedConvolutionNode::FilterIdx) ==
             ElemKind::Int8QTy) &&
-           (NI.getInElemTy(ChannelwiseQuantizedConvolutionNode::BiasIdx) ==
-            ElemKind::Int32QTy) &&
-           (NI.getInElemTy(ChannelwiseQuantizedConvolutionNode::ScalesIdx) ==
+           ((NI.getInElemTy(ChannelwiseQuantizedConvolutionNode::BiasIdx) ==
+             ElemKind::Int32QTy) ||
+            (NI.getInElemTy(ChannelwiseQuantizedConvolutionNode::BiasIdx) ==
+             ElemKind::FloatTy)) &&
+           (NI.getInElemTy(
+                ChannelwiseQuantizedConvolutionNode::FilterScalesIdx) ==
             ElemKind::FloatTy) &&
-           (NI.getInElemTy(ChannelwiseQuantizedConvolutionNode::OffsetsIdx) ==
+           (NI.getInElemTy(
+                ChannelwiseQuantizedConvolutionNode::FilterOffsetsIdx) ==
+
             ElemKind::Int32ITy) &&
            (NI.getOutElemTy(ChannelwiseQuantizedConvolutionNode::ResultIdx) ==
             ElemKind::Int8QTy);
@@ -365,7 +416,8 @@ bool NNPIBackend::isOpSupported(const NodeInfo &NI) const {
     auto resultK =
         NI.getOutElemTy(EmbeddingBagByteRowwiseOffsetsNode::ResultIdx);
     return (dataK == ElemKind::UInt8FusedQTy ||
-            dataK == ElemKind::UInt8FusedFP16QTy) &&
+            dataK == ElemKind::UInt8FusedFP16QTy ||
+            dataK == ElemKind::UInt4FusedFP16QTy) &&
            (resultK == ElemKind::FloatTy || resultK == ElemKind::Float16Ty) &&
            (indicesK == ElemKind::Int64ITy) && (offsetsK == ElemKind::Int64ITy);
   }
@@ -434,7 +486,7 @@ bool NNPIBackend::isOpSupported(const NodeInfo &NI) const {
 
   case Kinded::Kind::SoftMaxNodeKind:
     return NI.allInputsAndOutputsHaveSameElemKind(
-               {ElemKind::FloatTy, ElemKind::Float16Ty},
+               {ElemKind::FloatTy, ElemKind::Float16Ty, ElemKind::Int8QTy},
                {SoftMaxNode::SelectedIdx}) &&
            (NI.getInElemTy(SoftMaxNode::SelectedIdx) == ElemKind::Int64ITy);
 
@@ -449,6 +501,7 @@ bool NNPIBackend::isOpSupported(const NodeInfo &NI) const {
            (NI.getInElemTy(BatchOneHotNode::LengthsIdx) == ElemKind::Int32ITy);
 
   case Kinded::Kind::NNPICustomDSPNodeKind:
+  case Kinded::Kind::NNPICustomIANodeKind:
     return true;
 
   case Kinded::Kind::SpaceToDepthNodeKind:
@@ -483,6 +536,7 @@ bool NNPIBackend::shouldLower(const Node *N) const {
   case Kinded::Kind::TanhNodeKind:
   case Kinded::Kind::ReluNodeKind:
   case Kinded::Kind::ConvolutionNodeKind:
+  case Kinded::Kind::Convolution3DNodeKind:
   case Kinded::Kind::TileNodeKind:
   case Kinded::Kind::LogNodeKind:
   case Kinded::Kind::ReplaceNaNNodeKind:
@@ -495,6 +549,7 @@ bool NNPIBackend::shouldLower(const Node *N) const {
   case Kinded::Kind::AdaptiveAvgPoolNodeKind:
   case Kinded::Kind::EmbeddingBagNodeKind:
   case Kinded::Kind::EmbeddingBagByteRowwiseOffsetsNodeKind:
+  case Kinded::Kind::LayerNormalizationNodeKind:
     return false;
   case Kinded::Kind::FusedRowwiseQuantizedSparseLengthsSumNodeKind: {
     const FusedRowwiseQuantizedSparseLengthsSumNode *SLSN =
@@ -505,7 +560,6 @@ bool NNPIBackend::shouldLower(const Node *N) const {
       return true;
     }
   }
-  case Kinded::Kind::LayerNormalizationNodeKind:
   case Kinded::Kind::SparseLengthsSumNodeKind:
     // WA - lower until ICE-T implements it.
     if (NNPIBackend::backendOptions_.useIceT ||
@@ -653,13 +707,6 @@ static void setupBasicParallelizationConfigs(
   }
 }
 
-/// These are used for parsing backend-specific node options.
-static const std::string numParallelChunksKey = "NNPI_numParallelChunks";
-static const std::string parallelTransformKindKey =
-    "NNPI_parallelTransformKind";
-static const std::string extraEdgesKey = "NNPI_extraEdges";
-static const std::string coreAssignmentsKey = "NNPI_coreAssignments";
-
 /// If we've done some paralleization specified in \p replacedMap then propagate
 /// any NodeInfo from original nodes to the newly created Nodes in
 /// \p backendSpecificNodeInfo. Additionally, validate that the parallelization
@@ -696,7 +743,8 @@ static Error propagateBackendSpecificNodeInfo(
     const ConcatNode *CN = replacedPair.second;
     auto numParChunksIt = nodeInfo.find(numParallelChunksKey);
     RETURN_ERR_IF_NOT(numParChunksIt != nodeInfo.end(),
-                      "Must have corresponding " + numParallelChunksKey +
+                      "Must have corresponding " +
+                          std::string(numParallelChunksKey) +
                           " for any Node that was parallelized.");
     RETURN_ERR_IF_NOT(numParChunksIt->second.size() == 1,
                       "Expected a single value for numParallelChunks");
@@ -716,7 +764,8 @@ static Error propagateBackendSpecificNodeInfo(
         Node *inputCN = CN->getInputs()[i].getNode();
         auto &newCoreAssignments = currFunInfo[inputCN][coreAssignmentsKey];
         RETURN_ERR_IF_NOT(newCoreAssignments.size() == 0,
-                          coreAssignmentsKey + " should have been empty.");
+                          std::string(coreAssignmentsKey) +
+                              " should have been empty.");
         newCoreAssignments.push_back(coreAssignmentsIt->second[i]);
       }
     }
@@ -724,12 +773,29 @@ static Error propagateBackendSpecificNodeInfo(
     // Look for NNPI_extraEdges and propagate them into each Node.
     auto extraEdgesIt = nodeInfo.find(extraEdgesKey);
     if (extraEdgesIt != nodeInfo.end()) {
-      for (const NodeValue &inputCNNV : CN->getInputs()) {
+      for (dim_t inputNum = 0; inputNum < CN->getInputs().size(); inputNum++) {
+        const NodeValue &inputCNNV = CN->getInputs()[inputNum];
         auto &newExtraEdges = currFunInfo[inputCNNV.getNode()][extraEdgesKey];
         RETURN_ERR_IF_NOT(newExtraEdges.size() == 0,
-                          extraEdgesKey + " should have been empty.");
-        for (const std::string &edge : extraEdgesIt->second) {
-          newExtraEdges.push_back(edge);
+                          std::string(extraEdgesKey) +
+                              " should have been empty.");
+        for (std::string &edge : extraEdgesIt->second) {
+          // If a source split ID is specified via '$' then apply
+          // only to that input
+          ExtraEdgeSplitPair sourceEdgePair;
+          ASSIGN_VALUE_OR_RETURN_ERR(sourceEdgePair,
+                                     getExtraEdgeSourceSplitPair(edge));
+          if (sourceEdgePair.hasSplit) {
+            RETURN_ERR_IF_NOT(
+                sourceEdgePair.splitNum < CN->getInputs().size(),
+                "Source split num for edge exceeded size of the source split.");
+            edge = sourceEdgePair.label;
+            if (sourceEdgePair.splitNum == inputNum) {
+              newExtraEdges.push_back(edge);
+            }
+          } else {
+            newExtraEdges.push_back(edge);
+          }
         }
       }
     }
@@ -753,31 +819,49 @@ static Error propagateBackendSpecificNodeInfo(
       }
 
       for (std::string &edge : opts) {
+        ExtraEdgeSplitPair sourceEdgePair, targetEdgePair;
+        ASSIGN_VALUE_OR_RETURN_ERR(sourceEdgePair,
+                                   getExtraEdgeSourceSplitPair(edge));
+        ASSIGN_VALUE_OR_RETURN_ERR(
+            targetEdgePair, getExtraEdgeTargetSplitPair(sourceEdgePair.label));
+
         // Only process edges that were expected to be split.
-        llvm::StringRef edgeRef(edge);
-        if (!edgeRef.contains('@')) {
+        if (!targetEdgePair.hasSplit) {
           continue;
         }
+        auto it = nameToReplacementMap.find(targetEdgePair.label);
+        auto *targetNode = F->getNodeByName(targetEdgePair.label);
 
-        auto splitPair = edgeRef.split('@');
-        RETURN_ERR_IF_NOT(splitPair.second != "",
-                          "Edge must have an integer value after @");
+        // If the target of the edge was a parallelized node
+        if (it != nameToReplacementMap.end()) {
+          const ConcatNode *replaceCN = it->second;
+          RETURN_ERR_IF_NOT(
+              targetEdgePair.splitNum < replaceCN->getInputs().size(),
+              "targetEdgePair.splitNum for edge exceeded size of the split.");
 
-        int splitNum;
-        ASSIGN_VALUE_OR_RETURN_ERR(splitNum, getIntFromStr(splitPair.second));
+          // Finally, replace the name of the old edge (containing '@') with the
+          // name of the new edge created during the parallelization pass.
+          edge = replaceCN->getInputs()[targetEdgePair.splitNum]
+                     .getNode()
+                     ->getName()
+                     .str();
+        }
+        // If the target of the edge is a Concat
+        else if (targetNode && llvm::isa<ConcatNode>(targetNode)) {
+          ConcatNode *targetConcat = llvm::dyn_cast<ConcatNode>(targetNode);
+          edge = targetConcat->getName().str() + "@copy_" +
+                 std::to_string(targetEdgePair.splitNum);
+        } else {
+          RETURN_ERR_IF_NOT(it != nameToReplacementMap.end(),
+                            "Must target either a Concat or a replacement "
+                            "Concat for a parallelized edge: " +
+                                targetEdgePair.label);
+        }
 
-        auto it = nameToReplacementMap.find(splitPair.first);
-        RETURN_ERR_IF_NOT(
-            it != nameToReplacementMap.end(),
-            "Must have a replacement Concat for a parallelized edge.");
-
-        const ConcatNode *replaceCN = it->second;
-        RETURN_ERR_IF_NOT(splitNum < replaceCN->getInputs().size(),
-                          "splitNum for edge exceeded size of the split.");
-
-        // Finally, replace the name of the old edge (containing '@') with the
-        // name of the new edge created during the parallelization pass.
-        edge = replaceCN->getInputs()[splitNum].getNode()->getName().str();
+        // Add back the source edge annotation in case of Concat
+        if (sourceEdgePair.hasSplit) {
+          edge = std::to_string(sourceEdgePair.splitNum) + "$" + edge;
+        }
       }
     }
   }
@@ -810,7 +894,8 @@ static Error setupPerNodeParallelizationConfigs(
       continue;
     }
     RETURN_ERR_IF_NOT(parTransformKindIt->second.size() == 1,
-                      "Expected single value for " + parallelTransformKindKey);
+                      "Expected single value for " +
+                          std::string(parallelTransformKindKey));
     const std::string &pKindStr = parTransformKindIt->second.front();
     ParallelTransformKind pKind;
     if (pKindStr == "Data") {
@@ -820,7 +905,7 @@ static Error setupPerNodeParallelizationConfigs(
     } else if (pKindStr == "None") {
       pKind = ParallelTransformKind::None;
     } else {
-      return MAKE_ERR(parallelTransformKindKey + " " + pKindStr +
+      return MAKE_ERR(std::string(parallelTransformKindKey) + " " + pKindStr +
                       " not supported.");
     }
     if (pKind == ParallelTransformKind::None) {
@@ -831,11 +916,12 @@ static Error setupPerNodeParallelizationConfigs(
     // valid parallelTransformKind found above.
     auto numParChunksIt = nodeInfo.find(numParallelChunksKey);
     RETURN_ERR_IF_NOT(numParChunksIt != nodeInfo.end(),
-                      numParallelChunksKey + " and " +
-                          parallelTransformKindKey +
+                      std::string(numParallelChunksKey) + " and " +
+                          std::string(parallelTransformKindKey) +
                           " must be specified together.");
     RETURN_ERR_IF_NOT(numParChunksIt->second.size() == 1,
-                      "Expected single value for " + numParallelChunksKey);
+                      "Expected single value for " +
+                          std::string(numParallelChunksKey));
 
     int numChunks;
     ASSIGN_VALUE_OR_RETURN_ERR(numChunks,
@@ -921,77 +1007,6 @@ static Expected<bool> parallelizeFunction(Function *F, BackendOptions &opts,
   return true;
 }
 
-/// Peform validation on the final \p backendSpecificNodeInfo for \p F. If
-/// \p expectValidation then return failure if no info is found for \p F.
-static Error
-validateFinalNodeOpts(const Function *F,
-                      const BackendSpecificNodeInfo &backendSpecificNodeInfo,
-                      bool expectValidation) {
-  // If there's no info to validate for this Function then return early.
-  auto funNodeInfoIt = backendSpecificNodeInfo.find(F);
-  if (funNodeInfoIt == backendSpecificNodeInfo.end()) {
-    RETURN_ERR_IF_NOT(!expectValidation,
-                      "Expected to need validation for this Function.");
-    return Error::success();
-  }
-  auto &currFunInfo = funNodeInfoIt->second;
-
-  // Gather all Node names to more easily/efficiently validate extraEdges.
-  llvm::StringSet<> allNodeNames;
-  for (const Node &N : F->getNodes()) {
-    allNodeNames.insert(N.getName().str());
-  }
-
-  for (const auto &nodeInfoPair : currFunInfo) {
-    const Node *N = nodeInfoPair.first;
-    RETURN_ERR_IF_NOT(N->getParent() == F,
-                      "Node mapped to this Function in backendSpecificNodeInfo "
-                      "has incorrect parent.");
-    for (const auto &keyOptsPair : nodeInfoPair.second) {
-      const llvm::StringRef &key = keyOptsPair.getKey();
-      const std::vector<std::string> &opts = keyOptsPair.getValue();
-
-      RETURN_ERR_IF_NOT(key != numParallelChunksKey,
-                        "Should have processed and removed all " +
-                            numParallelChunksKey);
-
-      RETURN_ERR_IF_NOT(key != parallelTransformKindKey,
-                        "Should have processed and removed all " +
-                            parallelTransformKindKey);
-
-      if (key == coreAssignmentsKey) {
-        if (const ConcatNode *CN = llvm::dyn_cast<ConcatNode>(N)) {
-          RETURN_ERR_IF_NOT(opts.size() == CN->getInputs().size(),
-                            "Should have same number of " + coreAssignmentsKey +
-                                " (" + std::to_string(opts.size()) +
-                                ") as inputs to " + N->getName().str() + " (" +
-                                std::to_string(CN->getInputs().size()) + ")");
-        } else {
-          RETURN_ERR_IF_NOT(
-              opts.size() == 1,
-              strFormat("Should have only a single coreAssignment for %s",
-                        N->getName().data()));
-        }
-        for (auto &opt : opts) {
-          int core;
-          ASSIGN_VALUE_OR_RETURN_ERR(core, getIntFromStr(opt));
-          RETURN_ERR_IF_NOT(core >= 0 && core <= 11,
-                            "Core assignment must be [0-11]");
-        }
-      }
-
-      if (key == extraEdgesKey) {
-        for (const std::string &edgeName : opts) {
-          RETURN_ERR_IF_NOT(allNodeNames.count(edgeName),
-                            "Extra edge " + edgeName +
-                                " is not mapped to a current Node name.");
-        }
-      }
-    }
-  }
-  return Error::success();
-}
-
 Expected<std::unique_ptr<CompiledFunction>>
 NNPIBackend::compile(Function *F, const BackendOptions &opts) const {
   BackendOptions newOpts = opts;
@@ -1018,11 +1033,6 @@ NNPIBackend::compile(Function *F, const BackendOptions &opts) const {
     FPM.run(F, CompilationContext());
   }
 
-  // Validate backend-specific NodeOpts now that we've finished parallelization
-  // and cleanup.
-  RETURN_IF_ERR(
-      validateFinalNodeOpts(F, newOpts.backendSpecificNodeInfo, parallelized));
-
   std::unique_ptr<NNPICompiledFunction> compiledFunc =
       glow::make_unique<NNPICompiledFunction>(F);
   auto compileHasError = compiledFunc->compile(F, newOpts);
@@ -1033,54 +1043,75 @@ NNPIBackend::compile(Function *F, const BackendOptions &opts) const {
   return Expected<std::unique_ptr<CompiledFunction>>(std::move(compiledFunc));
 }
 
-FunctionPassPipeline NNPIBackend::getOptimizationPipeline() const {
+std::unique_ptr<FunctionPassPipeline>
+NNPIBackend::getOptimizationPipeline() const {
   // We temporarily need to disable FoldTileAddIntoBatchedAdd, as it is causing
   // issues for NNPI.
   auto pipeline = createDefaultGraphOptimizationPassPipeline();
-  pipeline.removeAllInstancesOfPass(FunctionPassID::FoldTileAddIntoBatchedAdd);
+  pipeline->removeAllInstancesOfPass(FunctionPassID::FoldTileAddIntoBatchedAdd);
 
   // Disable SinkCode, as NNPI does data parallel transformations and so we do
   // not want to undo that by sinking Nodes back together.
-  pipeline.removeAllInstancesOfPass(FunctionPassID::SinkCode);
+  pipeline->removeAllInstancesOfPass(FunctionPassID::SinkCode);
 
   // Raise Clips above Shape Nodes (e.g. Reshape) to try to ensure fusion
   // occurs. Note that we do this last as it may counteract some earlier
   // optimizations that push Clips down to try to eliminate them.
-  pipeline.pushBack(FunctionPassID::RaiseClipsAboveShapeNodes);
+  pipeline->pushBack(FunctionPassID::RaiseClipsAboveShapeNodes);
 
   // Optimize away intermediate conversions, e.g. Quantize(ConvertTo(Node)) ->
   // Quantize(Node).
-  pipeline.pushBack(FunctionPassID::OptimizeOutIntermediateConversions);
+  pipeline->pushBack(FunctionPassID::OptimizeOutIntermediateConversions);
 
   // Now that we've raised clips up try to optimize quantize-clip combos again.
-  pipeline.pushBack(FunctionPassID::OptimizeQuantizeClip);
+  pipeline->pushBack(FunctionPassID::OptimizeQuantizeClip);
 
   // Now try to eliminate any redundant Clips.
-  pipeline.pushBack(FunctionPassID::OptimizeClips);
+  pipeline->pushBack(FunctionPassID::OptimizeClips);
 
   // Look for float Relus that we can fuse up into quantized FCs.
-  pipeline.pushBack(FunctionPassID::OptimizeQuantFCFloatRelu);
+  pipeline->pushBack(FunctionPassID::OptimizeQuantFCFloatRelu);
 
   // Optimize concats and quantized/dequantize patterns.
-  pipeline.pushBack(FunctionPassID::OptimizeConcatQuantization);
+  pipeline->pushBack(FunctionPassID::OptimizeConcatQuantization);
 
   // Optimize quantization now that we've optimized some other quant nodes.
-  pipeline.pushBack(FunctionPassID::OptimizeQuantization);
+  pipeline->pushBack(
+      {FunctionPassID::OptimizeQuantization, ConvergenceMode::UntilFixedPoint});
 
   // Now try to sink conversions below concats.
-  pipeline.pushBack(FunctionPassID::SinkConversions);
+  pipeline->pushBack(FunctionPassID::SinkConversions);
 
   // Now that things have been sunk try to get rid of unnecessary concats.
-  pipeline.pushBack(FunctionPassID::OptimizeConcatNodes);
+  pipeline->pushBack(FunctionPassID::OptimizeConcatNodes);
+
+  // Now try to get rid of unnecessary splits right before concats.
+  pipeline->pushBack(FunctionPassID::EliminateSliceConcat);
 
   // Look for float Relus that we can fuse up into quantized FCs.
-  pipeline.pushBack(FunctionPassID::OptimizeQuantFCFloatRelu);
+  pipeline->pushBack(FunctionPassID::OptimizeQuantFCFloatRelu);
 
   // Optimize concats and quantized/dequantize patterns.
-  pipeline.pushBack(FunctionPassID::OptimizeConcatQuantization);
+  pipeline->pushBack(FunctionPassID::OptimizeConcatQuantization);
+
+  // Sink concats below quantizes in order to try to eliminate unnecessary
+  // quantizes above the concat.
+  pipeline->pushBack(FunctionPassID::SinkConcatBelowQuantize);
+
+  // Optimize quantization now that we've optimized some other quant nodes.
+  pipeline->pushBack(
+      {FunctionPassID::OptimizeQuantization, ConvergenceMode::UntilFixedPoint});
+
+  // Now try to also optimize clips next to quantizes since we raised quantizes
+  // above concats.
+  pipeline->pushBack(FunctionPassID::OptimizeQuantizeClip);
+
+  // Now try to sink conversions below concats again in case the concat quantize
+  // sinking didn't help.
+  pipeline->pushBack(FunctionPassID::SinkConversions);
 
   // Cleanup everything now.
-  pipeline.pushBack(getDCEPassConfig());
+  pipeline->pushBack(getDCEPassConfig());
 
   return pipeline;
 }
@@ -1183,4 +1214,83 @@ Expected<bool> NNPIBackend::transformPostLowering(
 #endif /* FACEBOOK_INTERNAL */
 
   return changed;
+}
+
+// Traverse the DAG and collect nodes in post order.
+static void
+traversePostOrder(const runtime::DAGNode *root,
+                  std::unordered_set<const runtime::DAGNode *> &visited,
+                  std::vector<const runtime::DAGNode *> &postOrder) {
+  if (root == nullptr) {
+    return;
+  }
+  visited.insert(root);
+  for (auto &c : root->children) {
+    if (visited.count(c) == 0) {
+      traversePostOrder(c, visited, postOrder);
+    }
+  }
+  postOrder.push_back(root);
+}
+
+Error NNPIBackend::bindContexts(
+    llvm::ArrayRef<runtime::ContextBinding> bindings,
+    const runtime::DAGNode *root, bool enableP2P, bool enableDRT) {
+  if (backendOptions_.dumpRuntime) {
+    DotWriter::clear();
+    DotWriter::addSubGraph("Host", "Host");
+  }
+
+  // Need post order to ensure p2p dest resources are created before their
+  // source (since source will handle the copy command).
+  std::unordered_set<const runtime::DAGNode *> visited;
+  std::vector<const runtime::DAGNode *> postOrder;
+  traversePostOrder(root, visited, postOrder);
+  runtime::PlaceholderUsageMap phUsage;
+  // Collect placeholders usage count.
+  for (const auto &cb : bindings) {
+    runtime::NNPIDeviceManager *nnpiDM =
+        dynamic_cast<runtime::NNPIDeviceManager *>(cb.device);
+    LOG_IF_NOT_RETURN_LLVMERROR(nnpiDM, "Invalid device manager");
+    nnpiDM->addPlaceholderUsageCount(cb.networkName, phUsage);
+  }
+
+  for (auto &usage : phUsage) {
+    LOG_IF_NOT_RETURN_LLVMERROR(
+        usage.second.numWriters < 2,
+        "Multiple writes to the same placeholder not suported");
+    usage.second.disableP2P = !enableP2P;
+    usage.second.disableDRT = !enableDRT;
+  }
+
+  for (auto *dagNode : postOrder) {
+    if (dagNode->backendName != "NNPI") {
+      continue;
+    }
+
+    // Find the contextbinding for this node (assuming there's only one).
+    ExecutionContext *ctx = nullptr;
+    runtime::DeviceManager *devMgr = nullptr;
+    for (auto &cb : bindings) {
+      if (cb.networkName == dagNode->name) {
+        ctx = cb.context;
+        devMgr = cb.device;
+        break;
+      }
+    }
+    if (ctx && devMgr) {
+      runtime::NNPIDeviceManager *nnpiDM =
+          dynamic_cast<runtime::NNPIDeviceManager *>(devMgr);
+      LOG_IF_NOT_RETURN_LLVMERROR(nnpiDM, "Invalid device manager bound");
+      LOG_IF_NOT_RETURN_LLVMERROR(
+          !nnpiDM->bindContext(dagNode->name, ctx, phUsage),
+          "Failed to bind context");
+    }
+  }
+
+  if (backendOptions_.dumpRuntime) {
+    DotWriter::writeToFile(root->name);
+  }
+
+  return Error::success();
 }

@@ -31,8 +31,8 @@
 namespace {
 
 template <class ElemTy>
-static void libjit_dump_tensor_impl(ElemTy *tensor, dim_t *dims,
-                                    dim_t numDims) {
+static void libjit_dump_tensor_console_impl(ElemTy *tensor, dim_t *dims,
+                                            dim_t numDims) {
   // Check for 0-dimensional tensor.
   if (!numDims) {
     printf("[ Scalar containing: %.3f ]\n", (float)tensor[0]);
@@ -116,6 +116,26 @@ static void libjit_dump_tensor_impl(ElemTy *tensor, dim_t *dims,
   }
 
   printf("]\n");
+}
+
+template <class ElemTy>
+static void libjit_dump_tensor_txt_impl(ElemTy *tensor, size_t tensorElemSize,
+                                        const char *filename,
+                                        const char *header) {
+  FILE *fh = fopen(filename, "w");
+  if (!fh) {
+    printf("ERROR opening file: '%s'!\n"
+           "File name might be too long!\n",
+           filename);
+    return;
+  }
+  if (strlen(header)) {
+    fprintf(fh, "%s\n", header);
+  }
+  for (size_t idx = 0, end = tensorElemSize; idx < end; idx++) {
+    fprintf(fh, "%f, ", (double)tensor[idx]);
+  }
+  fclose(fh);
 }
 
 template <typename ElemTy>
@@ -323,10 +343,13 @@ static int value_index_sort(const void *va, const void *vb) {
 /// size is the size of the input, and \p n is the size of the last dimension of
 /// the input.
 template <typename T, typename TI>
-static void libjit_topk(T *values, TI *indices, const T *input, TI *scratch,
+static void libjit_topk(T *values, TI *indices, const T *input, void *scratch,
                         dim_t k, dim_t n, dim_t size) {
   dim_t in = 0;
   dim_t out = 0;
+
+  // Initialize scratch with 0.
+  memset(scratch, 0, 2 * n * sizeof(TI));
 
   value_index<T, TI> *buffer = (value_index<T, TI> *)scratch;
 
@@ -755,10 +778,9 @@ static void libjit_arg_max_generic(const T *inW, T2 *outW, const dim_t *inWdims,
   }
 }
 
-template <typename SrcTy, typename DstTy>
-void libjit_resizenearest_generic(DstTy *dst, const SrcTy *src,
-                                  const float *scale, const dim_t *inWdims,
-                                  const dim_t *outWdims) {
+template <typename T>
+void libjit_resizenearest_generic(T *dst, const T *src, const float *scale,
+                                  const dim_t *inWdims, const dim_t *outWdims) {
 
   for (dim_t ob = 0; ob < outWdims[0]; ++ob) {
     auto ib = std::min(dim_t(ob / (scale[0])), inWdims[0] - 1);
@@ -771,6 +793,39 @@ void libjit_resizenearest_generic(DstTy *dst, const SrcTy *src,
           const dim_t inIndex = libjit_getXYZW(inWdims, ib, ih, iw, ic);
           const dim_t outIndex = libjit_getXYZW(outWdims, ob, oh, ow, oc);
           dst[outIndex] = src[inIndex];
+        }
+      }
+    }
+  }
+}
+
+template <typename T>
+static void
+libjit_resizebilinear_generic(T *dst, const T *src, const float *scale,
+                              const dim_t *inWdims, const dim_t *outWdims) {
+  for (dim_t ob = 0; ob < outWdims[0]; ++ob) {
+    for (dim_t oh = 0; oh < outWdims[1]; ++oh) {
+      for (dim_t ow = 0; ow < outWdims[2]; ++ow) {
+        float ihf = oh / scale[1];
+        float iwf = ow / scale[2];
+        dim_t ih = dim_t(ihf);
+        dim_t iw = dim_t(iwf);
+
+        auto ih0 = std::min(ih, inWdims[1] - 1);
+        auto ih1 = std::min(ih + 1, inWdims[1] - 1);
+        auto iw0 = std::min(iw, inWdims[2] - 1);
+        auto iw1 = std::min(iw + 1, inWdims[2] - 1);
+
+        for (dim_t oc = 0; oc < outWdims[3]; ++oc) {
+          float v00 = src[libjit_getXYZW(inWdims, ob, ih0, iw0, oc)];
+          float v01 = src[libjit_getXYZW(inWdims, ob, ih0, iw1, oc)];
+          float v10 = src[libjit_getXYZW(inWdims, ob, ih1, iw0, oc)];
+          float v11 = src[libjit_getXYZW(inWdims, ob, ih1, iw1, oc)];
+
+          float hd = v00 + (v10 - v00) * (ihf - ih);
+          float hw = v01 + (v11 - v01) * (ihf - ih);
+          float result = hd + (hw - hd) * (iwf - iw);
+          dst[libjit_getXYZW(outWdims, ob, oh, ow, oc)] = result;
         }
       }
     }
@@ -808,6 +863,10 @@ static void find_min_max_f(float *tensor, dim_t size, float &min, float &max) {
 
     if (tensorVal > max)
       max = tensorVal;
+
+    // Sanity check for NaN and Infinity.
+    assert(!std::isnan(tensor[i]) && "NaN value found!");
+    assert(!std::isinf(tensor[i]) && "Infinity value found!");
   }
 }
 
@@ -1395,6 +1454,7 @@ DEFINE_DATA_PARALLEL_KERNEL(libjit_elementmin_kernel_f, float,
 DEFINE_DATA_PARALLEL_KERNEL(libjit_copy_kernel_f, float, LHS[idx])
 DEFINE_DATA_PARALLEL_KERNEL(libjit_copy_kernel_u, int64_t, LHS[idx])
 DEFINE_DATA_PARALLEL_KERNEL(libjit_copy_kernel_i8, int8_t, LHS[idx])
+DEFINE_DATA_PARALLEL_KERNEL(libjit_copy_kernel_i16, int16_t, LHS[idx])
 DEFINE_DATA_PARALLEL_KERNEL(libjit_copy_kernel_i32, int32_t, LHS[idx])
 DEFINE_DATA_PARALLEL_KERNEL(libjit_copy_kernel_b, int8_t, LHS[idx])
 DEFINE_DATA_PARALLEL_KERNEL(libjit_element_add_kernel_f, float,
@@ -1429,9 +1489,10 @@ DEFINE_DATA_PARALLEL_KERNEL_QUANTIZED_M(libjit_element_mul_kernel_i8, lhs *rhs)
 DEFINE_DATA_PARALLEL_KERNEL_QUANTIZED_M(libjit_element_div_kernel_i8, lhs / rhs)
 
 /// This is a variable used by Glow backends to determine the actual type used
-/// for size_t and dim_t variables when libjit was compiled.
+/// for size_t, dim_t and int variables when libjit was compiled.
 size_t libjit_sizeTVar;
 dim_t libjit_dimTVar;
+int libjit_intVar;
 
 /// Specialize the Modulo kernel into two functions based on the
 /// value of SignFollowDivisor.
@@ -1514,13 +1575,27 @@ int8_t libjit_element_cmp_lt_kernel_i8(dim_t idx, const int8_t *LHS,
   return libjit_scale_i32i8(lhs, pre, post, scale, 0) < rhs ? 1 : 0;
 }
 
-// tanh cannot be vectorized by LLVM yet. Therefore we use the following
+// Tanh cannot be vectorized by LLVM yet. Therefore we use the following
 // formula instead: 1 - 2 / (exp(x * 2) + 1), which is also used by Caffe2 and
 // provides a good accuracy.
 // Once LLVM supports the vectorization of tanh, we can replace this
 // approximation by a direct tanh call.
-DEFINE_DATA_PARALLEL_KERNEL(libjit_tanh_kernel_f, float,
-                            1 - 2 / (expf(LHS[idx] * 2) + 1))
+// When the LIBJIT compile option "-ffast-math" is enabled the intermediate
+// computation expf(x) for Tanh operator is not handled properly for very
+// large positive values which results in NaN values for the Tanh output.
+// Therefore when the "-ffast-math" is enabled we compute the Tanh such that
+// we avoid computing large values for the "expf" function.
+#ifdef FFAST_MATH
+DEFINE_DATA_PARALLEL_KERNEL_FUNC(libjit_tanh_kernel_f) {
+  float inpVal = LHS[idx];
+  float tanhVal = -1 + 2 / (expf(-2 * std::abs(inpVal)) + 1);
+  return std::copysignf(tanhVal, inpVal);
+}
+#else
+DEFINE_DATA_PARALLEL_KERNEL_FUNC(libjit_tanh_kernel_f) {
+  return 1 - 2 / (expf(LHS[idx] * 2) + 1);
+}
+#endif // FFAST_MATH
 
 int8_t libjit_intlookuptable_kernel_i8(dim_t idx, const int8_t *src,
                                        const int8_t *mapping) {
@@ -1546,10 +1621,24 @@ int8_t libjit_elementselect_kernel_i8(dim_t idx, const int8_t *cond,
                                               rhsPost, rhsScale, destOffset));
 }
 
+// When the LIBJIT compile option "-ffast-math" is enabled the intermediate
+// computation expf(x) for Sigmoid operator is not handled properly for very
+// large positive values which results in NaN values for the Sigmoid output.
+// Therefore when the "-ffast-math" is enabled we compute the Sigmoid such that
+// we avoid computing large values for the "expf" function.
+#ifdef FFAST_MATH
+DEFINE_DATA_PARALLEL_KERNEL_FUNC(libjit_sigmoid_kernel_f) {
+  float inpVal = LHS[idx];
+  float sigmoidVal = 1 / (1 + expf(-std::abs(inpVal)));
+  return (float)(std::signbit(inpVal)) + std::copysignf(sigmoidVal, inpVal);
+}
+#else
 DEFINE_DATA_PARALLEL_KERNEL_FUNC(libjit_sigmoid_kernel_f) {
   float e = expf(-LHS[idx]);
   return 1 / (e + 1);
 }
+#endif // FFAST_MATH
+
 DEFINE_DATA_PARALLEL_KERNEL_WITH_IMM_OPERAND(libjit_element_maxsplat_kernel_f,
                                              float, MAX(LHS[idx], val))
 DEFINE_DATA_PARALLEL_KERNEL_WITH_IMM_OPERAND(libjit_element_maxsplat_kernel_i8,
@@ -2224,6 +2313,29 @@ void libjit_resizenearest_u(int64_t *dst, const int64_t *src,
   libjit_resizenearest_generic(dst, src, scale, inWdims, outWdims);
 }
 
+void libjit_resizebilinear_f(float *dst, const float *src, const float *scale,
+                             const dim_t *inWdims, const dim_t *outWdims) {
+  libjit_resizebilinear_generic(dst, src, scale, inWdims, outWdims);
+}
+
+void libjit_resizebilinear_i8(int8_t *dst, const int8_t *src,
+                              const float *scale, const dim_t *inWdims,
+                              const dim_t *outWdims) {
+  libjit_resizebilinear_generic(dst, src, scale, inWdims, outWdims);
+}
+
+void libjit_resizebilinear_i32(int32_t *dst, const int32_t *src,
+                               const float *scale, const dim_t *inWdims,
+                               const dim_t *outWdims) {
+  libjit_resizebilinear_generic(dst, src, scale, inWdims, outWdims);
+}
+
+void libjit_resizebilinear_u(int64_t *dst, const int64_t *src,
+                             const float *scale, const dim_t *inWdims,
+                             const dim_t *outWdims) {
+  libjit_resizebilinear_generic(dst, src, scale, inWdims, outWdims);
+}
+
 void libjit_avg_pool_i8(const int8_t *inW, int8_t *outW, const dim_t *inWdims,
                         const dim_t *outWdims, dim_t *kernelSizes,
                         dim_t *strides, dim_t *pads, int32_t outOffset,
@@ -2458,30 +2570,23 @@ void libjit_softmax_grad_f_i32(float *inG, float *outW,
   libjit_softmax_grad_generic(inG, outW, selectedW, idim, selectdim);
 }
 
-void libjit_sigmoid_f(const float *inW, float *outW, dim_t numElem) {
-  for (dim_t i = 0; i < numElem; i++) {
-    float e = expf(-inW[i]);
-    outW[i] = 1 / (e + 1);
-  }
-}
-
 void libjit_topk_f_u(float *values, size_t *indices, const float *input,
-                     size_t *scratch, dim_t k, dim_t n, dim_t size) {
+                     void *scratch, dim_t k, dim_t n, dim_t size) {
   libjit_topk(values, indices, input, scratch, k, n, size);
 }
 
 void libjit_topk_f_i32(float *values, int32_t *indices, const float *input,
-                       int32_t *scratch, dim_t k, dim_t n, dim_t size) {
+                       void *scratch, dim_t k, dim_t n, dim_t size) {
   libjit_topk(values, indices, input, scratch, k, n, size);
 }
 
 void libjit_topk_i8_u(int8_t *values, size_t *indices, const int8_t *input,
-                      size_t *scratch, dim_t k, dim_t n, dim_t size) {
+                      void *scratch, dim_t k, dim_t n, dim_t size) {
   libjit_topk(values, indices, input, scratch, k, n, size);
 }
 
 void libjit_topk_i8_i32(int8_t *values, int32_t *indices, const int8_t *input,
-                        int32_t *scratch, dim_t k, dim_t n, dim_t size) {
+                        void *scratch, dim_t k, dim_t n, dim_t size) {
   libjit_topk(values, indices, input, scratch, k, n, size);
 }
 
@@ -2624,9 +2729,13 @@ void libjit_space_to_depth_i8(const int8_t *inTensor, int8_t *outTensor,
   libjit_space_to_depth_generic(inTensor, outTensor, blockSize, inDims,
                                 outDims);
 }
-__attribute__((noinline)) void
-libjit_dump_tensor(uint8_t *tensor, dim_t *tensorDim, dim_t numDimsTensor,
-                   dim_t elemKind, const char *name) {
+
+/// Function to dump a tensor in text format in the console.
+__attribute__((noinline)) void libjit_dump_tensor_console(uint8_t *tensor,
+                                                          dim_t *tensorDim,
+                                                          dim_t numDimsTensor,
+                                                          dim_t elemKind,
+                                                          const char *name) {
   printf("%s\n", name);
   /// This definition should match the defintion in Glow.
   enum class ElemKind : unsigned char {
@@ -2644,16 +2753,17 @@ libjit_dump_tensor(uint8_t *tensor, dim_t *tensorDim, dim_t numDimsTensor,
   // Dump the content of a tensor.
   switch ((ElemKind)elemKind) {
   case ElemKind::FloatTy:
-    libjit_dump_tensor_impl((float *)tensor, tensorDim, numDimsTensor);
+    libjit_dump_tensor_console_impl((float *)tensor, tensorDim, numDimsTensor);
     break;
   case ElemKind::Int64ITy:
-    libjit_dump_tensor_impl((dim_t *)tensor, tensorDim, numDimsTensor);
+    libjit_dump_tensor_console_impl((dim_t *)tensor, tensorDim, numDimsTensor);
     break;
   case ElemKind::Int8QTy:
-    libjit_dump_tensor_impl((int8_t *)tensor, tensorDim, numDimsTensor);
+    libjit_dump_tensor_console_impl((int8_t *)tensor, tensorDim, numDimsTensor);
     break;
   case ElemKind::Int32QTy:
-    libjit_dump_tensor_impl((int32_t *)tensor, tensorDim, numDimsTensor);
+    libjit_dump_tensor_console_impl((int32_t *)tensor, tensorDim,
+                                    numDimsTensor);
     break;
   default:
     printf("Dumping this type of payload is not supported: %zu\n",
@@ -2662,6 +2772,48 @@ libjit_dump_tensor(uint8_t *tensor, dim_t *tensorDim, dim_t numDimsTensor,
   }
   puts("");
 }
+
+/// Function to dump a tensor in binary format in a file using the raw tensor
+/// data pointer \p tensor, the tensor data size \p tensorSize (in bytes) and
+/// the file name \p filename. A text header \p header will also be dumped.
+__attribute__((noinline)) void libjit_dump_tensor_bin(uint8_t *tensor,
+                                                      size_t tensorSize,
+                                                      const char *filename,
+                                                      const char *header) {
+  FILE *fh = fopen(filename, "wb");
+  if (!fh) {
+    printf("ERROR opening file: '%s'!\n"
+           "File name might be too long!\n",
+           filename);
+    return;
+  }
+  // Dump header.
+  fprintf(fh, "%s", header);
+  // Dump tensor data.
+  size_t size = fwrite(tensor, 1, tensorSize, fh);
+  assert((size == tensorSize) && "Error dumping tensor to file!");
+  (void)size;
+  fclose(fh);
+}
+
+/// Functions to dump a tensor in text format in a file using the raw tensor
+/// data pointer \p tensor, the tensor data size \p tensorElemSize (number of
+/// elements) and the file name \p filename. A text header \p header will also
+/// be dumped.
+#define DEFINE_DUMP_TENSOR_TXT_KERNEL(type, suffix)                            \
+  __attribute__((noinline)) void libjit_dump_tensor_txt_##suffix(              \
+      uint8_t *tensor, size_t tensorElemSize, const char *filename,            \
+      const char *header) {                                                    \
+    libjit_dump_tensor_txt_impl((type *)tensor, tensorElemSize, filename,      \
+                                header);                                       \
+  }
+DEFINE_DUMP_TENSOR_TXT_KERNEL(float, f)
+DEFINE_DUMP_TENSOR_TXT_KERNEL(int8_t, i8)
+DEFINE_DUMP_TENSOR_TXT_KERNEL(int16_t, i16)
+DEFINE_DUMP_TENSOR_TXT_KERNEL(int32_t, i32)
+DEFINE_DUMP_TENSOR_TXT_KERNEL(int64_t, u)
+DEFINE_DUMP_TENSOR_TXT_KERNEL(bool, b)
+#undef DEFINE_DUMP_TENSOR_TXT_KERNEL
 
 void libjit_write_timestamp(uint64_t *tensor, dim_t offset) {
   // We are using C++ timer here to a avoid issues with gettimeofday
@@ -2724,6 +2876,11 @@ libjit_quantization_profile(float *inputTensor, dim_t tensorSize,
   float newMax = MAX(maxInput, max);
   compInfo[0] = newMin;
   compInfo[1] = newMax;
+
+  // If input histogram is empty then return.
+  if (nBins == 0) {
+    return;
+  }
 
   // Initial profile.
   if (check_all_zeros(existingHistogram, nBins) == 1) {
@@ -2992,19 +3149,20 @@ void libjit_fft_real_f(float *output, float *input, const float *twiddleFactors,
 /// FFT LUTs \p twiddleFactors and \p bitReverseIndices are computed at
 /// compile-time. More details in Graph.h about the AudioSpectrogram node.
 void libjit_audio_spectrogram_f(
-    float *spectrogram, const float *input, const float *window,
-    const float *twiddleFactors, const int32_t *bitReverseIndices,
-    const float *complexToRealWeights, const dim_t *spectrogramDims,
-    const dim_t inputLength, const dim_t windowSize, const dim_t windowStride,
+    void *winOutScratch, void *fftOutScratch, float *spectrogram,
+    const float *input, const float *window, const float *twiddleFactors,
+    const int32_t *bitReverseIndices, const float *complexToRealWeights,
+    const dim_t *spectrogramDims, const dim_t inputLength,
+    const dim_t windowSize, const dim_t windowStride,
     const bool magnitudeSquared) {
 
   dim_t winNum = spectrogramDims[0];
   dim_t specLen = spectrogramDims[1];
   dim_t fftLen = (specLen - 1) * 2;
 
-  // Temporary buffers.
-  float winOut[fftLen];
-  float fftOut[fftLen + 2];
+  // Scratch buffers.
+  float *winOut = (float *)winOutScratch;
+  float *fftOut = (float *)fftOutScratch;
   memset(winOut, 0, fftLen * sizeof(float));
 
   // Compute the spectrogram.
@@ -3037,14 +3195,13 @@ void libjit_audio_spectrogram_f(
 /// \p spectrogram power. The lookup tables \p melWeights, \p melRanges
 /// and \p dctMat are computed at compile-time. More details in Graph.h
 /// about the MFCC node.
-void libjit_mfcc_f(float *coefficients, const float *spectrogram,
+void libjit_mfcc_f(void *scratch, float *coefficients, const float *spectrogram,
                    const float *melWeights, const int32_t *melRanges,
                    const float *dctMat, const dim_t *coefficientsDims,
                    const dim_t *spectrogramDims, const dim_t filterBankCount) {
 
-  // Allocate intermediate buffer on the stack.
-  // The size is expected to be relatively small.
-  float melBuff[filterBankCount];
+  // Scratch buffer.
+  float *melBuff = (float *)scratch;
 
   // Perform MFCC for all the windows.
   dim_t winNum = spectrogramDims[0];

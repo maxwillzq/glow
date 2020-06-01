@@ -417,10 +417,6 @@ Error Caffe2ModelLoader::loadConvQuantized(const caffe2::OperatorDef &op,
   // Group quantization only applies if there is more than one group.
   quantizeGroupwise &= group > 1;
 
-  if (quantizeGroupwise && dilation > 1) {
-    RETURN_ERR("Dilation not supported for group quantized convolution");
-  }
-
   NodeValue in;
   ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
 
@@ -500,9 +496,13 @@ Error Caffe2ModelLoader::loadConvQuantized(const caffe2::OperatorDef &op,
     ASSIGN_VALUE_OR_RETURN_ERR(wScales, getConstantByName(wScalesName));
     ASSIGN_VALUE_OR_RETURN_ERR(wOffsets, getConstantByName(wOffsetsName));
 
-    node = G_->createChannelwiseQuantizedConv(opName, finalIn, w, bias, wScales,
-                                              wOffsets, outTy, kernels, strides,
-                                              pads, group);
+    // Quantize the filter automatically (only if it is float). The bias is NOT
+    // quantized automatically and is left at the disposal of each Backend to
+    // quantize it later using custom logic.
+    node = G_->createChannelwiseQuantizedConv(
+        opName, finalIn, w, bias, wScales, wOffsets, /* biasScales */ nullptr,
+        /* biasOffsets */ nullptr, outTy, kernels, strides, pads, group,
+        dilation, /* quantizeFilter */ true, /* quantizeBias */ false);
   } else {
     // If the bias isn't quantized for a non group quantized conv, quantize it.
     const Tensor &biasTensor = bias->getPayload();
@@ -794,7 +794,7 @@ Error Caffe2ModelLoader::loadOperator(const caffe2::OperatorDef &op) {
   if (typeName == "Int8Dequantize") {
     NodeValue in;
     ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
-    auto *node = G_->createDequantize(opName, in);
+    auto *node = G_->createDequantize(opName, in, ElemKind::FloatTy);
     RETURN_IF_ERR(addNodeAsOutput(op, node));
     return Error::success();
   }
@@ -1168,6 +1168,14 @@ Error Caffe2ModelLoader::loadOperator(const caffe2::OperatorDef &op) {
     return Error::success();
   }
 
+  if (typeName == "Swish") {
+    NodeValue in;
+    ASSIGN_VALUE_OR_RETURN_ERR(in, getNodeValueByName(op.input(0)));
+    auto *S = G_->createSwish(opName, in);
+    RETURN_IF_ERR(addNodeAsOutput(op, S));
+    return Error::success();
+  }
+
   if (typeName == "Logit") {
     // Load the input and (optional) epsilon clamping value:
     NodeValue input;
@@ -1455,6 +1463,9 @@ Error Caffe2ModelLoader::loadOperator(const caffe2::OperatorDef &op) {
     LengthsMode lengthsMode;
     ASSIGN_VALUE_OR_RETURN_ERR(lengthsMode, getLengthsMode(dict));
 
+    float avgLength;
+    ASSIGN_VALUE_OR_RETURN_ERR(avgLength, getAvgLength(dict));
+
     Node *node;
     if (isFused) {
       // There is no specific fused quantized type in Caffe2, so we will load
@@ -1481,11 +1492,11 @@ Error Caffe2ModelLoader::loadOperator(const caffe2::OperatorDef &op) {
       if (isWeighted) {
         node = G_->createFusedRowwiseQuantizedSparseLengthsWeightedSum(
             opName, dataS, weights, indices, lengths,
-            /* useFP16Accumulation */ false, lengthsMode);
+            /* useFP16Accumulation */ false, lengthsMode, avgLength);
       } else {
         node = G_->createFusedRowwiseQuantizedSparseLengthsSum(
             opName, dataS, indices, lengths, /* useFP16Accumulation */ false,
-            lengthsMode);
+            lengthsMode, avgLength);
       }
 
       if (is4Bit) {
@@ -1525,12 +1536,12 @@ Error Caffe2ModelLoader::loadOperator(const caffe2::OperatorDef &op) {
         node = G_->createRowwiseQuantizedSparseLengthsWeightedSum(
             opName, dataS, dataScales, dataOffsets, weights, indices, lengths,
             /* precision */ ElemKind::FloatTy,
-            /* useFP16Accumulation */ false, lengthsMode);
+            /* useFP16Accumulation */ false, lengthsMode, avgLength);
       } else {
         node = G_->createRowwiseQuantizedSparseLengthsSum(
             opName, dataS, dataScales, dataOffsets, indices, lengths,
             /* precision */ ElemKind::FloatTy,
-            /* useFP16Accumulation */ false, lengthsMode);
+            /* useFP16Accumulation */ false, lengthsMode, avgLength);
       }
     }
 
@@ -2095,7 +2106,7 @@ Error Caffe2ModelLoader::initWithModule(caffe2::NetDef &networkDef,
   // partition_info then we create a single Function to load into. Otherwise
   // we create multiple Functions and switch between them as we load each
   // operator.
-  std::unordered_map<Function *, std::unordered_set<unsigned>> funToIDs;
+  std::unordered_map<Function *, std::vector<runtime::DeviceIDTy>> funToIDs;
   std::unordered_map<Function *, BackendSpecificOptions> funToOpts;
   if (networkDef.partition_info_size() == 0) {
     G_ = mod_.createFunction(funNamePrefix);
@@ -2106,7 +2117,7 @@ Error Caffe2ModelLoader::initWithModule(caffe2::NetDef &networkDef,
       Function *PF = mod_.createFunction(funName);
       partNameToFun_[pName] = PF;
       for (auto id : networkDef.partition_info(i).device_id()) {
-        funToIDs[PF].insert(id);
+        funToIDs[PF].push_back(id);
       }
 
       // Now set up device options for this partition.
@@ -2143,6 +2154,10 @@ Error Caffe2ModelLoader::initWithModule(caffe2::NetDef &networkDef,
       PPC->funcs.push_back(F);
       PPC->logicalIDs.emplace_back(funToIDs[F]);
       PPC->backendSpecificOpts.emplace_back(funToOpts[F]);
+      // Replication counts not currently loaded through C2, so default to 1.
+      PPC->replicationCounts.emplace_back(1);
+      // Backend hints not currently loaded through C2, so use default.
+      PPC->backendHints.emplace_back();
       RETURN_ERR_IF_NOT(F->verify(), "Function verification failed.");
     }
   }

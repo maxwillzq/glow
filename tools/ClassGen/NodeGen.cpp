@@ -87,8 +87,8 @@ int main(int argc, char **argv) {
       .addInput("Bias")
       .addMember(MemberType::VectorUnsigned, "Kernels")
       .addMember(MemberType::VectorUnsigned, "Strides")
-      .addMember(MemberType::VectorUnsigned, "Pads")
-      .addMember(MemberType::Unsigned, "Group")
+      .addMember(MemberType::VectorUnsigned, "Pads", /* addSetter */ true)
+      .addMember(MemberType::Unsigned, "Group", /* addSetter */ true)
       .addMember(MemberType::Unsigned, "Dilation")
       .addMember(MEMBER_TYPE_INFO(glow::ConvolutionLayout), "Layout")
       .addFusedActivation()
@@ -105,17 +105,23 @@ int main(int argc, char **argv) {
       .addInput("Input")
       .addInput("Filter")
       .addInput("Bias")
-      .addInput("Scales")
-      .addInput("Offsets")
+      .addInput("FilterScales")
+      .addInput("FilterOffsets")
+      .addInput("BiasScales")
+      .addInput("BiasOffsets")
       .addMember(MemberType::VectorUnsigned, "Kernels")
       .addMember(MemberType::VectorUnsigned, "Strides")
       .addMember(MemberType::VectorUnsigned, "Pads")
       .addMember(MemberType::Unsigned, "Group")
+      .addMember(MemberType::Unsigned, "Dilation")
       .addResultFromCtorArg()
-      .setDocstring("Performs 2D Convolution using a given Input, Filter, and "
-                    "Bias tensors, as well as provided Kernels, Strides, Pads, "
-                    "and Group. Quantization parameters are provided by Scales "
-                    "and Offsets.");
+      .setDocstring(
+          "Performs 2D Convolution using a given Input, Filter, and "
+          "Bias tensors, as well as provided Kernels, Strides, Pads, "
+          "and Group. The filter channel wise quantization parameters "
+          "are provided by FilterScales and FilterOffsets while the "
+          "bias channel wise quantization parameters are provided by "
+          "BiasScales and BiasOffsets.");
 
   BB.newNode("ConvTranspose")
       .addInput("Input")
@@ -149,7 +155,7 @@ int main(int argc, char **argv) {
       .addInput("Input")
       .addMember(MemberType::VectorUnsigned, "Kernels")
       .addMember(MemberType::VectorUnsigned, "Strides")
-      .addMember(MemberType::VectorUnsigned, "Pads")
+      .addMember(MemberType::VectorUnsigned, "Pads", /* addSetter */ true)
       .addMember(MemberType::Enum, "Layout")
       .addResultFromCtorArg("Result")
       .addResultFromCtorArg("Argmax")
@@ -172,7 +178,7 @@ int main(int argc, char **argv) {
       .addInput("Input")
       .addMember(MemberType::VectorUnsigned, "Kernels")
       .addMember(MemberType::VectorUnsigned, "Strides")
-      .addMember(MemberType::VectorUnsigned, "Pads")
+      .addMember(MemberType::VectorUnsigned, "Pads", /* addSetter */ true)
       .addMember(MemberType::Enum, "Layout")
       .addResultFromCtorArg()
       .addGradient()
@@ -422,6 +428,13 @@ int main(int argc, char **argv) {
       .dataParallel()
       .setDocstring("Performs element-wise exponential to the Input.");
   // clang-format on
+
+  BB.newNode("Logit")
+      .addInput("Input")
+      .addMember(MemberType::Float, "Epsilon")
+      .addResultFromCtorArg()
+      .dataParallel()
+      .setDocstring("Computes elementwise: result = log(input / (1 - input)).");
 
   BB.newNode("Select")
       .addInput("Cond")
@@ -750,6 +763,13 @@ int main(int argc, char **argv) {
       .setDocstring("Applies Sigmoid, 1 / (1 + exp(-x)), to each element in "
                     "the Input tensor.");
 
+  BB.newNode("Swish")
+      .addInput("Input")
+      .addResultFromCtorArg()
+      .dataParallel()
+      .setDocstring("Applies Swish, X * Sigmoid(X), to each element in "
+                    "the Input tensor.");
+
   BB.newNode("Tanh")
       .addInput("Input")
       .addResultFromCtorArg()
@@ -890,6 +910,17 @@ int main(int argc, char **argv) {
           "neighbor interpolation. The Output tensor is of shape "
           "floor(input_dimension * scale)");
 
+  BB.newNode("ResizeBilinear")
+      .addInput("Input")
+      .addMember(MemberType::VectorFloat, "Scale")
+      .addResultFromCtorArg()
+      .setDocstring(
+          "Given Input tensor of [N,H,W,C], where N is the batch, C is the "
+          "channel or depth, H is the height and W is the width, Generates an "
+          "Output tensor with resized spatial dimensions using bilinear "
+          "neighbor interpolation. The Output tensor is of shape "
+          "floor(input_dimension * scale)");
+
   //===--------------------------------------------------------------------===//
   //                Reorder transformations
   //===--------------------------------------------------------------------===//
@@ -913,6 +944,19 @@ int main(int argc, char **argv) {
       .setDocstring("Generate a tensor of a specific type filled with 'Value'."
                     "Splat always keep floating point value internally but can"
                     "quantize it based on the output type.");
+
+  // clang-format off
+  BB.newNode("Touch")
+    .addResultFromCtorArg()
+    .setDocstring(
+      "Generate a tensor of a specific type without initializing "
+      "it. This is useful when filling a big tensor entirely with "
+      "multiple small slices using InsertTensor nodes such that "
+      "the big tensor is not required to be initialized (filled) "
+      "with some value prior to insertion. This node is intended "
+      "to remove the overhead associated with the initialization "
+      "in situations where it is not required.");
+  // clang-format on
 
   BB.newNode("SGD")
       .addInput("Gradient")

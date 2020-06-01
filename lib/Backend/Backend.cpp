@@ -22,7 +22,7 @@
 #include "glow/Graph/TensorLayout.h"
 #include "glow/IR/Instrs.h"
 #include "glow/Optimizer/GraphOptimizer/CompilationContext.h"
-#include "glow/Optimizer/GraphOptimizerPipeline/Pipeline.h"
+#include "glow/Optimizer/GraphOptimizer/FunctionPassPipeline.h"
 
 using namespace glow;
 
@@ -76,7 +76,7 @@ void Backend::autoInstrument(TraceInfo &traceInfo, IRFunction *IR) const {
   // Default name for the instrumentation placeholder, will be made unique by
   // createPlaceholder.
   std::string name = F->getName().str() + "_instrumentation";
-  Placeholder *backingPH = F->getParent()->getPlaceholderByName(name);
+  Placeholder *backingPH = F->getParent()->getPlaceholderByNameSlow(name);
 
   auto &varmap = IR->getVariableMap();
   auto type = F->getParent()->uniqueType(
@@ -187,11 +187,17 @@ TensorLayoutCommon &Backend::getTensorLayoutRequirements() const {
   return CanonicalTensorLayout::getInstance();
 }
 
-FunctionPassPipeline Backend::getOptimizationPipeline() const {
-  auto p = createDefaultGraphOptimizationPassPipeline();
+std::unique_ptr<FunctionPassPipeline> Backend::getOptimizationPipeline() const {
+  auto pipeline = createDefaultGraphOptimizationPassPipeline();
   // Fold Tile followed by Add into BatchedAdd. Currently this is not part of
   // the default pipeline to avoid issues with some backends. If backends do not
   // want this opt then they should override getOptimizationPipeline().
-  p.pushFront({FunctionPassID::FoldTileAddIntoBatchedAdd});
-  return p;
-};
+  pipeline->pushFront({FunctionPassID::FoldTileAddIntoBatchedAdd});
+  return pipeline;
+}
+
+std::unique_ptr<IRFunctionPassPipeline>
+Backend::getIROptimizationPipeline() const {
+  auto pipeline = createDefaultIRFunctionOptimizationPipeline();
+  return pipeline;
+}

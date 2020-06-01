@@ -26,8 +26,9 @@
 
 #include <fstream>
 namespace glow {
-bool GlowEnableLoadBalancedPartitioning = false;
+bool GlowEnableLoadBalancedPartitioning = true;
 bool GlowLogPartition = false;
+bool GlowDumpPartition = false;
 static llvm::cl::opt<bool, /* ExternalStorage */ true>
     GlowEnableLoadBalancedPartitioningOpt(
         "glow_partitioner_enable_load_balance",
@@ -45,10 +46,11 @@ static llvm::cl::opt<bool, /* ExternalStorage */ true> logPartition(
 
 /// -dump-partition - Command line option to dump the graph of each partitions
 /// by calling F->dumpDAG().
-static llvm::cl::opt<bool>
+static llvm::cl::opt<bool, /* ExternalStorage */ true>
     dumpPartition("dump-partition",
                   llvm::cl::desc("Enable dumping the graph of each partitions"),
-                  llvm::cl::init(false), llvm::cl::cat(PartitionerCat));
+                  llvm::cl::location(glow::GlowDumpPartition),
+                  llvm::cl::cat(PartitionerCat));
 
 using namespace glow;
 using llvm::isa;
@@ -79,11 +81,10 @@ Error Partitioner::finalize(const DAGListTy &partitions,
   // needs the backend specific verifier. Tensor layouts, for example, might
   // have gone from canonical form to backend specific form.
 
-  LOG(INFO) << "The number of partitions is : "
-            << module_->getFunctions().size() << "\n";
-
   if (logPartition) {
-    LOG(INFO) << "Dumping partitioning DAG to DAG.dot file.\n";
+    LOG(INFO) << "The number of partitions is : "
+              << module_->getFunctions().size();
+    LOG(INFO) << "Dumping partitioning DAG to DAG.dot file.";
     dumpDAG("DAG.dot", partitions);
     logPartitionInfo(mapping);
   }
@@ -107,18 +108,16 @@ Error Partitioner::finalize(const DAGListTy &partitions,
 }
 
 Partitioner::Partitioner(Module *parent, const std::vector<DeviceInfo> &devices,
-                         const std::vector<Backend *> &backends,
-                         bool saturateHost, bool optimized)
+                         const std::vector<Backend *> &backends, bool optimized)
     : module_(parent), deviceInfo_(devices), backends_(backends),
-      saturateHost_(saturateHost), optimized_(optimized) {
+      optimized_(optimized) {
   init();
 }
 
 Partitioner::Partitioner(Module *parent, const std::vector<DeviceInfo> &devices,
-                         bool saturateHost, bool optimized,
-                         PartitionConfig partitionConfig)
-    : module_(parent), deviceInfo_(devices), saturateHost_(saturateHost),
-      optimized_(optimized), partitionConfig_(partitionConfig) {
+                         bool optimized, PartitionConfig partitionConfig)
+    : module_(parent), deviceInfo_(devices), optimized_(optimized),
+      partitionConfig_(partitionConfig) {
   init();
 }
 
@@ -191,6 +190,7 @@ NodeToFunctionMap Partitioner::selectPartitions(Function *F,
   mapping.createPartition(newF, backendName);
   NodesSet currentPartition;
   GraphMemInfo graphMem;
+  graphMem.contextCount = contextCount_;
 
   for (int i = level - 1; i >= 0; i--) {
     for (size_t j = 0, e = bfs[i].size(); j < e; j++) {
@@ -434,7 +434,7 @@ Expected<DAGListTy> Partitioner::createDAGWithoutPartition(
     nodes.push_back(std::move(DAG1));
     partitions.push_back({std::move(DAG0), std::move(nodes)});
   }
-  if (saturateHost_) {
+  if (cctx.saturateHost) {
     // Saturate the Host.
     saturateHost(1, partitions);
   }
@@ -455,13 +455,6 @@ Expected<DAGListTy> Partitioner::createDAGWithoutPartition(
 
 Expected<DAGListTy> Partitioner::loadBalancedPartition(CompilationContext &cctx,
                                                        size_t numDevices) {
-  if (module_->getFunctions().size() != 1) {
-    return MAKE_ERR(
-        ErrorValue::ErrorCode::PARTITIONER_ERROR,
-        strFormat("Invalid : %lu functions in a module. Now in load-balanced "
-                  "partition flow, the module can only contain 1 function",
-                  module_->getFunctions().size()));
-  }
 
   if (multiBackendNames_) {
     VLOG(1) << "For multi backend types, load-balanced partition can't be "
@@ -473,9 +466,22 @@ Expected<DAGListTy> Partitioner::loadBalancedPartition(CompilationContext &cctx,
   DAGListTy partitions;
   std::vector<Backend *> backends;
   genBackendMap(backendMap_, backendHolder_, backends);
+  auto backendName = backends[0]->getBackendName();
+
+  if (memSize_ < backendMap_[backendName].memSize) {
+    // No partition is needed. Create DAGNode and return. This root is always a
+    // dummy function.
+    if (logPartition) {
+      LOG(INFO) << "The model is too small for applying partition.\n"
+                << "Model size : " << memSize_ << "\n"
+                << "Backend Name : " << backendName << "\n"
+                << "Device memory: " << backendMap_[backendName].memSize
+                << "\n";
+    }
+    return createDAGWithoutPartition(backendName, backendMap_, cctx);
+  }
 
   // Step 1: Get the minial number of partitions from auto-partition.
-  auto backendName = backends[0]->getBackendName();
   uint64_t availableMemory = backendMap_[backendName].memSize;
   if (!optimized_) {
     RETURN_IF_ERR(::glow::optimizeFunction(F_, *(backends[0]), cctx));
@@ -624,7 +630,7 @@ Expected<DAGListTy> Partitioner::loadBalancedPartition(CompilationContext &cctx,
                      cctx.backendOpts.backendSpecificNodeInfo);
   module_->eraseFunction(F_);
 
-  if (saturateHost_ &&
+  if (cctx.saturateHost &&
       partitionMap.getPartitions().size() < deviceInfo_.size()) {
     saturateHost(logicalDeviceID_, partitions);
   }
@@ -772,7 +778,7 @@ Partitioner::heterogeneousPartition(CompilationContext &cctx) {
 
   // Step 5 : Post-partition optimization - Adjust the logicalDevice for each
   // DAGNode.
-  if (saturateHost_ && backends.size() == 1 &&
+  if (cctx.saturateHost && backends.size() == 1 &&
       mapping.getPartitions().size() < deviceInfo_.size()) {
     // Attempt to saturate the host when there is only one type of backend.
     // Passing in the count of logical devices. Since logicalId starts at 0 we
@@ -928,12 +934,14 @@ Partitioner::setupPrepartitionedModule(CompilationContext &cctx) {
 
   const std::vector<Function *> &funcs = config.funcs;
 
+  Backend *B = backends[0];
+  auto backendName = B->getBackendName();
+
   // Optimize all Functions if necessary.
   if (!optimized_) {
-    Backend *B = backends[0];
     for (Function *F : funcs) {
       RETURN_IF_ERR(::glow::optimizeFunction(
-          F, *B, cctx, &getDeviceInfoForBackend(B->getBackendName())));
+          F, *B, cctx, &getDeviceInfoForBackend(backendName)));
     }
   }
 
@@ -966,11 +974,26 @@ Partitioner::setupPrepartitionedModule(CompilationContext &cctx) {
   }
   RETURN_IF_ERR(logicalDevicesValidation(partitionMap, backendMap_));
 
-  // Copy in backend-specific options that were loaded.
-  DCHECK(funcs.size() == config.backendSpecificOpts.size());
+  // Copy in or validate all members of the PPC.
+  RETURN_ERR_IF_NOT(
+      funcs.size() == config.backendSpecificOpts.size(),
+      "Number of Functions must equal number of backendSpecificOpts");
+  RETURN_ERR_IF_NOT(funcs.size() == config.backendHints.size(),
+                    "Number of Functions must equal number of backendHints");
+  RETURN_ERR_IF_NOT(funcs.size() == config.replicationCounts.size(),
+                    "Number of Functions must equal");
+  RETURN_ERR_IF_NOT(
+      funcs.size() == config.backendNames.size() || config.backendNames.empty(),
+      "If there are backendNames specified, there must be one per Function");
   for (size_t i = 0, e = funcs.size(); i < e; i++) {
     Function *F = funcs[i];
     partitionMap.setBackendSpecificOpts(F, config.backendSpecificOpts[i]);
+    partitionMap.setBackendHints(F, config.backendHints[i]);
+    partitionMap.addReplicationCount(F, config.replicationCounts[i]);
+    if (!config.backendNames.empty()) {
+      RETURN_ERR_IF_NOT(backendName == config.backendNames[i],
+                        "Mismatch on backendName for partition");
+    }
   }
 
   // Do partition.
@@ -1028,70 +1051,57 @@ static void cloneSplatWeightsIfNecessary(T *SLWS, Function *F) {
 void Partitioner::sparseNNInsertSplitConcat(
     Function *F, std::vector<SLSDeviceInfo> slsDevices,
     std::vector<SLSTableInfo> slsTables, PartitionConfig &partitionConfig) {
-  std::map<ConcatNode *, std::vector<NodeValue>> newConcatInputs;
-  std::map<ConcatNode *, std::vector<NodeValue>> oldConcatInputs;
-  for (size_t p = 0; p < slsDevices.size(); p++) {
 
-    // Pool SLS outputs which go directly to concats for this device
-    std::map<ConcatNode *, std::vector<NodeValue>> extraConcatInputs;
-    for (auto &table : slsTables) {
-      if (table.deviceId == p) {
-        if (table.slsClipResult.getNumUsers() != 1) {
-          continue;
-        }
-        auto slsClipUser =
-            (*(table.slsClipResult.getUsers().begin())).getUser();
-        if (ConcatNode *concatNode = llvm::dyn_cast<ConcatNode>(slsClipUser)) {
-          extraConcatInputs[concatNode].push_back(table.slsClipResult);
-        }
+  // Walk through SLS tables and check that all the results are able to concat
+  if (slsTables.size() == 0) {
+    return;
+  }
+  auto templateTable = slsTables[0];
+  auto templateDims = templateTable.slsClipResult.dims();
+  auto templateConcatDim = templateDims.size() - 1;
+  std::vector<std::vector<NodeValue>> concatInputs(slsDevices.size());
+
+  for (auto &table : slsTables) {
+    auto tableDims = table.slsClipResult.dims();
+    if (tableDims.size() != templateDims.size()) {
+      return;
+    }
+    for (dim_t otherDim = 0; otherDim < templateConcatDim; otherDim++) {
+      if (tableDims[otherDim] != templateDims[otherDim]) {
+        return;
       }
     }
-
-    // For each set of pooled SLS outputs, insert Concat->Split
-    for (auto &inpList : extraConcatInputs) {
-
-      // Create a new concat and assign it to SLS partition
-      ConcatNode *concatNode = inpList.first;
-      std::vector<NodeValue> concatInputs = inpList.second;
-      auto *deviceConcat = F->createConcat(concatNode->getName().str() +
-                                               "_dev" + std::to_string(p),
-                                           concatInputs, concatNode->getDim());
-      partitionConfig.nodeToPartition[deviceConcat->getName()] = p;
-
-      // Create a split
-      std::vector<dim_t> splits;
-      for (auto &inp : concatInputs) {
-        auto inpDims = inp.dims();
-        splits.push_back(inpDims[concatNode->getDim()]);
-        oldConcatInputs[concatNode].push_back(inp);
-      }
-      std::vector<SliceNode *> splitOutputs;
-      F->createSplit(concatNode->getName().str() + "_split_dev" +
-                         std::to_string(p),
-                     deviceConcat, splits.size(), concatNode->getDim(), splits,
-                     splitOutputs);
-      for (auto &splitOutput : splitOutputs) {
-        partitionConfig.nodeToPartition[splitOutput->getName()] =
-            partitionConfig.numOfPartitions - 1;
-        newConcatInputs[concatNode].push_back(splitOutput);
-      }
+    if (table.slsClipResult.getType()->getElementType() !=
+        templateTable.slsClipResult.getType()->getElementType()) {
+      return;
     }
+    concatInputs[table.deviceId].push_back(table.slsClipResult);
   }
 
-  // Create a new concat node and replace specified inputs with the
-  // new slice outputs
-  for (auto &concatNodeReplace : newConcatInputs) {
-    ConcatNode *concatNode = concatNodeReplace.first;
-    std::vector<NodeValue> newInputs = newConcatInputs[concatNode];
-    std::vector<NodeValue> oldInputs = oldConcatInputs[concatNode];
-    std::vector<NodeValue> combinedInputs;
-    for (auto concatInputIdx = 0; concatInputIdx < concatNode->getNumInputs();
-         concatInputIdx++) {
-      auto concatInput = concatNode->getNthInput(concatInputIdx);
-      auto it = find(oldInputs.begin(), oldInputs.end(), concatInput);
-      if (it != oldInputs.end()) {
-        auto idx = distance(oldInputs.begin(), it);
-        concatNode->setNthInput(concatInputIdx, newInputs[idx]);
+  // Insert concat and slice nodes and assign them to partitions
+  for (size_t p = 0; p < slsDevices.size(); p++) {
+    if (concatInputs[p].size() > 1) {
+
+      // Insert concat
+      auto *deviceConcat = F->createConcat("concat_dev_" + std::to_string(p),
+                                           concatInputs[p], templateConcatDim);
+      partitionConfig.nodeToPartition[deviceConcat->getName()] = p;
+
+      // Insert slices
+      std::vector<dim_t> splits(concatInputs[p].size());
+      for (dim_t i = 0; i < concatInputs[p].size(); i++) {
+        auto inputDim = concatInputs[p][i].dims();
+        splits[i] = inputDim[templateConcatDim];
+      }
+      std::vector<SliceNode *> splitOutputs;
+      F->createSplit("split_dev" + std::to_string(p), deviceConcat,
+                     splits.size(), templateConcatDim, splits, splitOutputs);
+      for (dim_t i = 0; i < concatInputs[p].size(); i++) {
+        assert(i < splitOutputs.size());
+        concatInputs[p][i].replaceAllUsesOfWith(splitOutputs[i]);
+        deviceConcat->setNthInput(i, concatInputs[p][i]);
+        partitionConfig.nodeToPartition[splitOutputs[i]->getName()] =
+            partitionConfig.numOfPartitions - 1;
       }
     }
   }
@@ -1366,7 +1376,7 @@ Expected<DAGListTy> Partitioner::partitionSparseNN(CompilationContext &cctx) {
   }
 
   auto partitions = partitionFromConfig(partitionConfig, cctx);
-  if (saturateHost_) {
+  if (cctx.saturateHost) {
     saturateHost(cctx.optimizationOpts.sparseNNPartitioningSchemeNumCards,
                  std::move(partitions.get()));
   }

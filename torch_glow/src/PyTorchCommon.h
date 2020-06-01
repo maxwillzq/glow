@@ -24,6 +24,8 @@
 
 #include <torch/csrc/jit/ir/ir.h>
 
+DECLARE_bool(dumpFinalGlowGraph);
+
 namespace glow {
 
 /// For Glow: -128 <= orig_fp32/scale_1 + offset_1 <= 127
@@ -59,6 +61,11 @@ struct PyTorchLoaderSettings {
   /// nodes. 0 indicates no minimum size.
   size_t minFusionGroupSize = 0;
 
+  /// The maximum total number of nodes which are allowed to merge when
+  /// fusing groups. The resulting group may be larger than this limit
+  /// however as additional nodes may be inserted during the merge.
+  size_t maxFusionMergeSize = 0;
+
   /// Index (inclusive) of the first node in the JIT graph to fuse. Ignored if
   /// negative.
   /// NOTE: this should only be used for debugging.
@@ -71,6 +78,9 @@ struct PyTorchLoaderSettings {
 
   /// Convert fp32 opts to fp16 ops during Glow compilation.
   bool convertToFP16 = false;
+
+  /// Convert fp32 fused opts to fp16 ops during Glow compilation.
+  bool convertFusedToFP16 = false;
 
   /// Dump Glow dot graph to file after Glow compilation is finished.
   bool dumpFinalGlowGraph = false;
@@ -91,6 +101,9 @@ struct PyTorchLoaderSettings {
   /// Whether or not to write the loaded Glow function and inputs and outputs to
   /// and from the function to file as ONNX graphs.
   bool writeToOnnx = false;
+
+  /// Whether or not to do a numerical comparions of Glow and jit outputs
+  bool jitVsGlowCompare = false;
 
   /// Name of a YAML file containing backend specific options.
   std::string backendOptionsFile;
@@ -145,6 +158,15 @@ glow::Tensor ptTensorToGlowTensor(const at::Tensor &ptTensor);
 /// Given a Glow Type \p glowType, \returns an empty PyTorch Tensor with a
 /// matching type.
 at::Tensor glowTypeToEmptyPTTensor(const glow::Type &glowType);
+
+/// Enable overriding signal handlers while exeucting torch_glow code. This
+/// should only be used in Python to enable easier debugging and not in
+/// production C++ multithreaded environments. \p enable is used to enable or
+/// disable overriding if set to false.
+void enableSignalHandlerOverrides(bool enable = true);
+
+/// \returns whether or not signal handler overriding is enabled.
+bool signalHandlerOverridesEnabled();
 
 } // namespace glow
 

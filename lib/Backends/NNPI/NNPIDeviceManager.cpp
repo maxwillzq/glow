@@ -19,6 +19,7 @@
 #include "NNPI.h"
 #include "NNPICompiledFunction.h"
 #include "NNPITracing.h"
+#include "NNPIUtils.h"
 #include "glow/Support/Error.h"
 #include "nnpi_inference.h"
 #include "nnpi_transformer.h"
@@ -60,30 +61,15 @@ std::atomic<RunIdentifierTy> NNPIDeviceManager::runIdentifier_;
 
 NNPIDeviceManager::NNPIDeviceManager(
     const DeviceConfig &config,
-    std::shared_ptr<NNPIDeviceOptions> deviceOptions, NNPIAdapter adapter,
-    unsigned numInferenceWorkers)
-    : DeviceManager(config), numWorkersPerFunction_(numInferenceWorkers),
-      deviceId_(config_.deviceID), adapter_(adapter),
+    std::shared_ptr<NNPIDeviceOptions> deviceOptions, NNPIAdapter adapter)
+    : DeviceManager(config), deviceId_(config_.deviceID), adapter_(adapter),
       device_(NNPI_INVALID_NNPIHANDLE), deviceOptions_(deviceOptions) {
-
   if (deviceOptions_->showVars) {
     LOG(INFO) << deviceOptions_->dumpStatus();
   }
   if (deviceOptions_->deviceId >= 0) {
     deviceId_ = static_cast<unsigned>(deviceOptions_->deviceId);
   }
-
-  if (!numWorkersPerFunction_) {
-    numWorkersPerFunction_ = 2;
-  }
-
-  if (deviceOptions_->numWorkers > 0) {
-    numWorkersPerFunction_ = deviceOptions_->numWorkers;
-  }
-
-  // Ice-ref not re-entrant for the same nnpiNetwork.
-  numWorkersPerFunction_ =
-      deviceOptions_->inferOnDevice ? numWorkersPerFunction_ : 1;
 }
 
 NNPIDeviceManager::~NNPIDeviceManager() {
@@ -133,9 +119,6 @@ Error NNPIDeviceManager::init() {
     LOG_NNPI_INF_IF_ERROR_RETURN_LLVMERROR(
         nnpiDeviceContextCreate(adapter_, deviceId_, &device_),
         "Failed to create NNPI Device");
-    if (deviceOptions_->enabledDeviceTracing) {
-      deviceTracing_ = NNPIDeviceTracing::getForDevice(deviceId_);
-    }
     NNPIDeviceInfo deviceInfo;
     LOG_NNPI_INF_IF_ERROR_RETURN_LLVMERROR(
         nnpiDeviceGetInfo(deviceId_, &deviceInfo),
@@ -201,8 +184,8 @@ void NNPIDeviceManager::addNetwork(const Module *module,
     functions_.emplace(func.first, func.second);
     usedMemoryBytes_ += functionCost_; // TODO:: static moduleSize.
     auto err = inferenceEnvs_[func.first].init(
-        numWorkersPerFunction_, adapter_, device_, deviceTracing_, func.second,
-        &staticPlaceholders_, deviceOptions_, func.first, deviceId_);
+        adapter_, device_, func.second, &staticPlaceholders_, deviceOptions_,
+        func.first, deviceId_);
     if (err) {
       functions_.erase(func.first);
       lock.unlock();
@@ -252,7 +235,7 @@ void NNPIDeviceManager::evictNetwork(std::string functionName,
   if (evictCB) {
     evictCB(functionName, std::move(err));
   } else {
-    llvm::errs() << errorToString(std::move(err));
+    llvm::errs() << ERR_TO_STRING(std::move(err));
   }
 }
 
@@ -292,7 +275,13 @@ uint64_t NNPIDeviceManager::getAvailableMemory() const {
       LOG_NNPI_INF_IF_ERROR(res, "Failed to read available memory from device.")
       return 0;
     }
-    return static_cast<uint64_t>(devStatus.availableUnprotectedMemory) * KB;
+    const auto availableMem =
+        static_cast<uint64_t>(devStatus.availableUnprotectedMemory) * KB;
+    if (availableMem == 0) {
+      LOG(WARNING) << "NNPI Device " << deviceId_
+                   << " available memory: " << availableMem;
+    }
+    return availableMem;
   }
   auto freeMemory = getMaximumMemory();
   for (const auto &p : functions_) {
@@ -319,12 +308,13 @@ void NNPIDeviceManager::transferStaticPlaceholderToDevice(
       nnpiResource != nullptr,
       "Static placeholder no longer exists on the device", resultCB);
 
-  nnpiResource->UpdateDeviceResourceFromTensor(T, resultCB);
+  nnpiResource->updateDeviceResourceFromTensor(T, resultCB);
 };
 
 Error NNPIDeviceManager::startDeviceTrace(TraceContext *traceContext) {
-  if (!NNPIDeviceTracing::getForDevice(deviceId_)->start(traceContext,
-                                                         device_)) {
+  if (!NNPIDeviceTracing::getForDevice(deviceId_)->start(
+          traceContext, device_, true /* Software traces are always enabled. */,
+          deviceOptions_->hardwareTraces)) {
     return MAKE_ERR("Failed to start NNPI device trace.");
   }
   return Error::success();
@@ -336,6 +326,43 @@ Error NNPIDeviceManager::stopDeviceTrace(TraceContext *traceContext) {
     return MAKE_ERR("Failed to stop NNPI device trace.");
   }
   return Error::success();
+}
+
+Error NNPIDeviceManager::bindContext(std::string functionName,
+                                     ExecutionContext *ctx,
+                                     PlaceholderUsageMap &phUsage) {
+  if (deviceOptions_->dumpRuntime) {
+    DotWriter::addSubGraph(std::to_string(device_),
+                           std::string("Device ") + std::to_string(deviceId_) +
+                               " (" + DotWriter::getHexStr(device_) + ")");
+  }
+
+  // Create inference context.
+  ASSERT_WITH_MSG(inferenceEnvs_.count(functionName), "Invalid function name.");
+  std::shared_ptr<InferenceContext> infCtx(
+      inferenceEnvs_.at(functionName).createDetachedInferenceContext(phUsage));
+  ASSERT_WITH_MSG(infCtx, "Failed to create detached context");
+
+  // Set the inference context into NNPIDeviceBinding and store in the ExCtx.
+  ctx->setDeviceBindings(std::make_unique<NNPIDeviceBindings>(infCtx));
+  return Error::success();
+}
+
+void NNPIDeviceManager::addPlaceholderUsageCount(std::string functionName,
+                                                 PlaceholderUsageMap &phUsage) {
+  if (functions_.count(functionName)) {
+    NNPICompiledFunction *func =
+        dynamic_cast<NNPICompiledFunction *>(functions_.at(functionName));
+    ASSERT_WITH_MSG(func, "Invalid function.");
+    for (auto inputName : func->getInputNames()) {
+      phUsage[inputName].numReaders++;
+      phUsage[inputName].devices.insert(device_);
+    }
+    for (auto outputName : func->getOutputNames()) {
+      phUsage[outputName].numWriters++;
+      phUsage[outputName].devices.insert(device_);
+    }
+  }
 }
 
 } // namespace runtime

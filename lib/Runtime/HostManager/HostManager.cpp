@@ -16,6 +16,7 @@
 
 #include "glow/Runtime/HostManager/HostManager.h"
 #include "glow/Backends/DeviceManager.h"
+#include "glow/Exporter/ONNXModelWriter.h"
 #include "glow/Graph/PlaceholderBindings.h"
 #include "glow/Optimizer/GraphOptimizer/GraphOptimizer.h"
 #include "glow/Partitioner/Partitioner.h"
@@ -25,6 +26,7 @@
 #include "glow/Support/Support.h"
 
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
 
 #include <glog/logging.h>
@@ -46,12 +48,39 @@ llvm::cl::opt<std::string> loadBackendSpecificOptionsOpt(
     llvm::cl::cat(hostManagerCat));
 } // namespace
 
+namespace glow {
+namespace runtime {
+bool GlowEnableP2P = false;
+bool GlowEnableDRT = false;
+} // namespace runtime
+} // namespace glow
+
+#if FACEBOOK_INTERNAL
+Error optimizeDAG(DAGListTy &nodeList, const Provisioner &provisioner,
+                  Module &mod, const std::vector<DeviceInfo> &devices,
+                  CompilationContext &cctx);
+#endif /* FACEBOOK_INTERNAL */
+
 /// The device configs file used for Runtime.
 llvm::cl::opt<std::string> loadDeviceConfigsFileOpt(
     "load-device-configs",
     llvm::cl::desc("Load device configs used in Runtime"),
     llvm::cl::value_desc("configs.yaml"), llvm::cl::Optional,
     llvm::cl::cat(hostManagerCat));
+
+/// Allows enabling DRT support.
+llvm::cl::opt<bool, /* ExternalStorage */ true>
+    enableDRT("enable-DRT", llvm::cl::desc("Enabled DRT support"),
+              llvm::cl::Optional,
+              llvm::cl::location(glow::runtime::GlowEnableDRT),
+              llvm::cl::cat(hostManagerCat));
+
+/// Allows enabling P2P support.
+llvm::cl::opt<bool, /* ExternalStorage */ true>
+    enableP2P("enable-P2P", llvm::cl::desc("Enabled P2P support"),
+              llvm::cl::Optional,
+              llvm::cl::location(glow::runtime::GlowEnableP2P),
+              llvm::cl::cat(hostManagerCat));
 
 HostManager::HostManager()
     : config_(), statsExporterRegistry_(StatsExporterRegistry::Stats()) {}
@@ -108,7 +137,6 @@ Error HostManager::init(std::vector<std::unique_ptr<DeviceConfig>> configs) {
   DeviceIDTy deviceCount = 0;
 
   for (auto &config : configs) {
-    config->deviceID = deviceCount;
     if (!config->hasName()) {
       config->name = "config" + std::to_string(deviceCount);
     }
@@ -152,7 +180,26 @@ void HostManager::cleanupAddNetwork(llvm::ArrayRef<std::string> names) {
 }
 
 Error HostManager::addNetwork(std::unique_ptr<Module> module,
-                              CompilationContext &cctx, bool saturateHost) {
+                              CompilationContext &cctx) {
+  ScopeGuard debugDumpDAGGuard([&]() {
+    if (cctx.dumpFinalGraph) {
+      for (Function *F : module->getFunctions()) {
+        auto fname =
+            strFormat("final_graph_dbg_err_%s.dot", F->getName().data());
+        LOG(INFO) << "Dumping final graph due to error to " << fname;
+        F->dumpDAG(fname);
+      }
+    }
+  });
+
+  /// If specified in the cctx, this will prevent Constants from being modified
+  /// until the current scope ends or the preventer is dismissed. Does so by
+  /// swapping in temporary Placeholders instead of Constants.
+  ConstantModificationPreventer constModPreventer(*module);
+  if (cctx.optimizationOpts.delayAndRecordConstantModification) {
+    constModPreventer.activate();
+  }
+
   std::vector<std::string> names;
   {
     std::unique_lock<std::shared_timed_mutex> networkLock(networkLock_);
@@ -227,8 +274,12 @@ Error HostManager::addNetwork(std::unique_ptr<Module> module,
       }
     }
   }
-  Partitioner partitioner(module.get(), deviceInfo, saturateHost,
-                          skipOptimizations);
+  Partitioner partitioner(module.get(), deviceInfo, skipOptimizations);
+  if (cctx.enableP2P || cctx.enableDRT) {
+    partitioner.setContextCount(config_.maxActiveRequests);
+  } else {
+    partitioner.setContextCount(2);
+  }
   DAGListTy nodeList;
   auto result = partitioner.partition(cctx);
   if (result) {
@@ -261,6 +312,63 @@ Error HostManager::addNetwork(std::unique_ptr<Module> module,
     executor_.reset(new ThreadPoolExecutor(devices_, config_.executorThreads));
   }
 
+  // If we prevented constant modification then run constant folding with
+  // recording now. Record so that if we are going to serialize we can embed the
+  // constant folding subgraphs in the Glow ONNX model.
+  ConstantFoldingRecordMap record;
+  if (cctx.optimizationOpts.delayAndRecordConstantModification) {
+    constModPreventer.deactivateAndCleanup();
+
+    RETURN_ERR_IF_NOT(nodeList.size() == 1, "Expect only one DAG.");
+    const auto &dag = *nodeList.begin();
+    for (auto &dagNode : dag.nodes) {
+      Function *F = module->getFunction(dagNode->name);
+      RETURN_ERR_IF_NOT(
+          F, strFormat("Function %s not found", dagNode->name.data()));
+
+      ConstantFoldingRecordMap currRecord = constantFoldAndRecord(F, cctx);
+      record.insert(currRecord.begin(), currRecord.end());
+      runDCEPass(F, cctx);
+
+      // Verify the Function is valid after constant folding takes place.
+      Backend &B = provisioner_->getBackend(dagNode->backendName);
+      RETURN_ERR_IF_NOT(B.verify(*F, cctx.verboseCompile),
+                        "Unsupported node(s) found after optimizing Function " +
+                            F->getName().str() + " for backend " +
+                            B.getBackendName());
+    }
+  }
+
+#if FACEBOOK_INTERNAL
+  if (cctx.callDAGOptimizer) {
+    auto optDagErr =
+        optimizeDAG(nodeList, *provisioner_, *module, deviceInfo, cctx);
+    if (optDagErr) {
+      std::unique_lock<std::shared_timed_mutex> networkLock(networkLock_);
+      cleanupAddNetwork(names);
+      return optDagErr;
+    }
+  }
+#endif /* FACEBOOK_INTERNAL */
+
+  // If requested, serialize the resulting DAG that was just optimized and
+  // partitioned.
+  if (cctx.serializeCompiledDAG) {
+    std::string loc = nodeList.begin()->root->name + ".onnx";
+    LOG(INFO) << "Serializing DAG to " << loc;
+    {
+      Error writeErr = Error::empty();
+      ONNXModelWriter onnxWR(loc, nodeList, 7, 9, &writeErr,
+                             /* textMode */ false, /* zipMode */ false,
+                             /* includeConstantData */ false, record);
+      RETURN_IF_ERR(writeErr);
+    }
+  }
+
+  // Now that we've serialized the model if requested, cleanup the temporary
+  // Functions and PHs used for constant folding.
+  cleanupConstantFolding(*module, record);
+
   auto err = provisioner_->provision(nodeList, *module, cctx);
   if (err) {
     {
@@ -269,6 +377,7 @@ Error HostManager::addNetwork(std::unique_ptr<Module> module,
     }
     return err;
   }
+  debugDumpDAGGuard.dismiss();
 
   {
     std::unique_lock<std::shared_timed_mutex> networkLock(networkLock_);
@@ -277,7 +386,8 @@ Error HostManager::addNetwork(std::unique_ptr<Module> module,
       // Note: currently getNextNetworkExecutionState assumes that pool size is
       // >= currentInFlight requests, so we set pool size to maxActiveRequests.
       executor_->createPool(node.root.get(), config_.maxActiveRequests,
-                            cctx.enableP2P, cctx.enableDRT);
+                            cctx.enableP2P || GlowEnableP2P,
+                            cctx.enableDRT || GlowEnableDRT);
     }
   }
   // Clear constants contents from the module then put it in a
@@ -487,6 +597,7 @@ HostManager::runNetwork(llvm::StringRef networkName,
     }
 
     if (network == nullptr) {
+      TRACE_EVENT_SCOPE_END();
       callback(
           currentRun,
           MAKE_ERR(ErrorValue::ErrorCode::RUNTIME_NET_NOT_FOUND,
@@ -501,6 +612,7 @@ HostManager::runNetwork(llvm::StringRef networkName,
       if (queueSize >= config_.maxQueueSize) {
         // The queue is full, return an error.
         network->refcount--;
+        TRACE_EVENT_SCOPE_END();
         callback(
             currentRun,
             MAKE_ERR(
@@ -518,6 +630,7 @@ HostManager::runNetwork(llvm::StringRef networkName,
                                priority, currentRun);
     {
       std::unique_lock<std::shared_timed_mutex> lock(inferQueueLock_);
+      TRACE_EVENT_SCOPE_END();
       inferQueue_.push(std::move(queuedRequest));
     }
   }
@@ -525,7 +638,6 @@ HostManager::runNetwork(llvm::StringRef networkName,
   // If we haven't reached maxActiveRequests kick off next request.
   size_t activeRequestCount = activeRequestCount_++;
   if (activeRequestCount < config_.maxActiveRequests) {
-    TRACE_EVENT_SCOPE_END();
     dispatchNextRun();
     return currentRun;
   }

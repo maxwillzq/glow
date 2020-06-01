@@ -21,6 +21,7 @@
 #include "glow/Backend/CompiledFunction.h"
 #include "glow/Backends/BackendOptions.h"
 #include "glow/ExecutionContext/ExecutionContext.h"
+#include "nnpi_inference_types.h"
 #include "nnpi_transformer.h"
 #include <map>
 #include <memory>
@@ -28,15 +29,45 @@
 
 namespace glow {
 
+/// Struct containing details exported for a compiled tensor.
+struct NNPICompiledTensor {
+  std::string name;
+  std::string type;
+  std::vector<uint32_t> shape;
+  NNPI_ALLOCATION_TYPE allocType;
+  std::string dump() const;
+};
+
+/// Struct containing details exported for a compiled operator.
+struct NNPICompiledOp {
+  std::string name;
+  std::string type;
+  NNPI_EXECUTION_TYPE execType;
+  int32_t coreIndex;
+  int32_t iceBo;
+  std::vector<NNPICompiledTensor> inputs;
+  std::vector<NNPICompiledTensor> outputs;
+  std::string dump() const;
+};
+
+/// Collection of exported details for compiled functions.
+struct NNPICompilationInfo {
+  std::map<std::string, NNPICompiledOp> ops;
+  std::vector<std::pair<std::string, std::string>> opDependencies;
+  std::string dump(const std::string &functionName) const;
+  void clear() {
+    ops.clear();
+    opDependencies.clear();
+  }
+};
+
 /// Function "compiled" for execution by the NNPI backend.
 class NNPICompiledFunction final : public CompiledFunction {
 public:
-  NNPICompiledFunction(Function *F)
-      : CompiledFunction(runtime::RuntimeBundle::create(*F)),
-        compilationOptions_({}){};
-
   /// \name CompiledFunction interface.
   ///@{
+  NNPICompiledFunction(Function *F);
+
   ~NNPICompiledFunction() override;
 
   /// Execute the network and allocate Placeholder memory with given
@@ -81,6 +112,24 @@ public:
     return compilationFileName_;
   }
 
+  const std::vector<std::string> &getInputNames() const { return inputNames_; }
+
+  const std::vector<std::string> &getOutputNames() const {
+    return outputNames_;
+  }
+
+  NNPIDeviceNetworkConfig getDeviceNetworkConfig() const {
+    return devNetConfig_;
+  }
+
+  const std::vector<std::string> &getIAExtensionPaths() const {
+    return iaExtensionPaths_;
+  }
+
+  const NNPICompilationInfo &getCompilationInfo() const {
+    return compilationInfo_;
+  }
+
 private:
   NNPINetwork network_;
   NNPICompilationConfig config_;
@@ -90,9 +139,23 @@ private:
   std::unordered_set<const Placeholder *> staticInputs_;
   NNPICompilationOptions compilationOptions_;
   std::string compilationFileName_;
+  std::vector<std::string> inputNames_;
+  std::vector<std::string> outputNames_;
+  NNPIDeviceNetworkConfig devNetConfig_;
+  std::vector<std::string> iaExtensionPaths_;
+  NNPICompilationInfo compilationInfo_;
 
   Error updateCompilationConfigFromOptions(
       NNPICompilationOptions &compilationOptions);
+
+  /// Setup compilation hints for \p F given \p backendSpecificNodeInfo.
+  /// \returns an error if some validation issue is found given expected format.
+  Error
+  setupCompilationHints(const Function *F,
+                        const BackendSpecificNodeInfo &backendSpecificNodeInfo);
+
+  /// Update the internal compilation info object. Return true iff successful.
+  bool updateCompilationInfo();
   ///@}
 };
 } // end namespace glow

@@ -112,6 +112,8 @@ private:
   /// during loading.
   std::unordered_map<const torch::jit::Value *, ValueMapping> valueMap_;
 
+  std::unordered_map<const torch::jit::Value *, torch::jit::IValue> qparamsMap_;
+
   /// Flags if the memory held by aten::Constants of Tensor type should be
   /// copied.
   const bool copyTensorMemory_;
@@ -184,7 +186,7 @@ public:
   static Error loadJITGraphForOnnxTraining(
       glow::Function &F, const torch::jit::Graph &graph,
       const at::ArrayRef<torch::jit::IValue> inputs,
-      const std::vector<at::Tensor> &parameters,
+      const std::vector<torch::jit::IValue> &parameters,
       std::vector<glow::Placeholder *> &inputPlaceholders,
       std::vector<glow::Placeholder *> &outputPlaceholders);
 
@@ -206,7 +208,7 @@ private:
   /// inputPlaceholders and \p outputPlaceholders are filled out.
   /// This is only used by loadJITGraphForOnnxTraining.
   PyTorchModelLoader(glow::Function &F, const torch::jit::Graph &graph,
-                     const std::vector<at::Tensor> &parameters,
+                     const std::vector<torch::jit::IValue> &parameters,
                      std::vector<glow::Placeholder *> &inputPlaceholders,
                      std::vector<glow::Placeholder *> &outputPlaceholders,
                      Error &error,
@@ -347,6 +349,17 @@ private:
   // \returns error on failure.
   Error loadEmbeddingBagByteRowwiseOffsets(const torch::jit::Node *ptNode);
 
+  // Load a PyTorch fb::embedding_bag_4bit_rowwise_offsets.
+  // \returns error on failure.
+  Error loadEmbeddingBag4BitRowwiseOffsets(const torch::jit::Node *ptNode);
+
+  // Helper function that implements the loading logic for
+  // fb::embedding_bag_4bit_rowwise_offsets and
+  // fb::embedding_bag_byte_rowwise_offsets.
+  // \returns error on failure.
+  Error loadEmbeddingBagByteRowwiseOffsetsHelper(const torch::jit::Node *ptNode,
+                                                 bool is4Bit = false);
+
   /// Load all PyTorch prim::GetAttr nodes in \p graph. This method uses the
   /// PyTorch Module hierarchy to map Values for all outputs of prim::GetAttr
   /// nodes. If the output type of a prim::GetAttr is a tensor, this will load
@@ -372,6 +385,10 @@ private:
   /// Load a PyTorch type_as node.
   /// \returns error on failure.
   Error loadTypeAs(const torch::jit::Node *ptNode);
+
+  /// Load a PyTorch contiguous node.
+  /// \returns error on failure.
+  Error loadContiguous(const torch::jit::Node *ptNode);
 
   /// Helper function for loading arithmetic nodes. \p name is of the name of
   /// the node in the Glow graph, \p lhs and \p rhs are the inputs to the
@@ -445,6 +462,10 @@ private:
   /// \returns error on failure.
   Error loadConvolution(const torch::jit::Node *ptNode);
 
+  /// Load a PyTorch conv2d node.
+  /// \returns error on failure.
+  Error loadConv2D(const torch::jit::Node *ptNode);
+
   /// Load a PyTorch batch_norm node.
   /// \returns error on failure.
   Error loadBatchNorm(const torch::jit::Node *ptNode);
@@ -468,6 +489,11 @@ private:
   /// Load a glow::unpacked_quantized_conv node.
   // \return error on failure.
   Error loadQuantizedConvUnpacked(const torch::jit::Node *ptNode);
+
+  Error loadQuantizedConvReluUnpacked(const torch::jit::Node *ptNode);
+
+  Error loadQuantizedConvUnpackedImpl(const torch::jit::Node *ptNode,
+                                      bool isRelu = false);
 
   /// Load a PyTorch quantized::conv2d node.
   // \return error on failure.
@@ -560,6 +586,10 @@ private:
   /// Load a PyTorch aten::reshape node.
   /// \returns error on failure.
   Error loadReshape(const torch::jit::Node *ptNode);
+
+  /// Load a PyTorch aten::view node.
+  /// \returns error on failure.
+  Error loadView(const torch::jit::Node *ptNode);
 
   /// Load a PyTorch aten::mm node.
   /// \returns error on failure.

@@ -89,10 +89,10 @@ public:
   Value(llvm::StringRef name, TypeRef T, Kinded::Kind k)
       : Named(name), Typed(T), Kinded(k) {}
 
-  void verifyUseList(const InstructionNumbering &InstrNumbering) const;
+  bool verifyUseList(const InstructionNumbering &InstrNumbering) const;
 
   /// Verify the correctness of the instruction parameters.
-  void verify(const IRFunction &M) const;
+  bool verify(const IRFunction &M) const;
 
   /// Dump a textual representation of the Value into provided output stream.
   void dump(llvm::raw_ostream &out) const;
@@ -192,11 +192,14 @@ public:
   /// \returns the operands of the instruction.
   llvm::ArrayRef<Operand> getOperands() const { return ops_; }
 
+  /// \returns the name of the operand.
+  llvm::StringRef getOperandName(unsigned idx) const;
+
   /// Check the correctness of the use-list.
-  void verifyUseList(const InstructionNumbering &InstrNumbering) const;
+  bool verifyUseList(const InstructionNumbering &InstrNumbering) const;
 
   /// Verify the correctness of the instruction parameters.
-  void verify() const;
+  bool verify() const;
 
   /// The static dispatch version of isInplaceOp.
   static bool isInplaceOp(const Instruction *I, unsigned dstIdx,
@@ -296,7 +299,7 @@ class Value;
 class Node;
 
 /// A function that represents the compilation unit.
-class IRFunction final : public Named {
+class IRFunction final : public IRContainer {
 public:
   using VariableMap = llvm::MapVector<const Storage *, Value *>;
   using InstListTy = TaggedList<Instruction, InstructionTraits>;
@@ -380,7 +383,7 @@ public:
   }
 
   /// Verify the correctness of the function.
-  void verify() const;
+  bool verify() const;
 
   /// Dump a textual representation of the IRFunction into default output
   /// stream.

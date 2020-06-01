@@ -27,6 +27,8 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace glow {
@@ -34,6 +36,7 @@ class NNPICompiledFunction;
 namespace runtime {
 
 class NNPIResource;
+class InferenceContext;
 using StaticPlaceholderMap =
     std::unordered_map<const Placeholder *, std::weak_ptr<NNPIResource>>;
 
@@ -50,8 +53,6 @@ class NNPIDeviceManager : public DeviceManager {
   uint64_t usedMemoryBytes_{0};
   /// Static memory cost of the InterpreterFunction.
   const uint64_t functionCost_{1};
-  /// Number of worker threads allocated per loaded function.
-  unsigned numWorkersPerFunction_;
 
   /// Inference id counter.
   static std::atomic<RunIdentifierTy> runIdentifier_;
@@ -67,8 +68,6 @@ class NNPIDeviceManager : public DeviceManager {
   NNPIDeviceContext device_;
   /// Lock to synchronize function adding/removing to/from the device manager.
   std::mutex functionMapMutex_;
-  /// Device Tracing control.
-  std::shared_ptr<NNPIDeviceTracing> deviceTracing_;
   /// Static placeholders known by the device manager (the device manager
   /// doesn't own a ref on static resources, only networks added to the device
   /// manager).
@@ -79,8 +78,7 @@ class NNPIDeviceManager : public DeviceManager {
 public:
   explicit NNPIDeviceManager(const DeviceConfig &config,
                              std::shared_ptr<NNPIDeviceOptions> deviceOptions,
-                             NNPIAdapter adapter,
-                             unsigned numInferenceWorkers = 0);
+                             NNPIAdapter adapter);
   virtual ~NNPIDeviceManager();
 
   Error init() override;
@@ -101,6 +99,29 @@ public:
 
   virtual Error startDeviceTrace(TraceContext *traceContext) override;
   virtual Error stopDeviceTrace(TraceContext *traceContext) override;
+  Error bindContext(std::string functionName, ExecutionContext *ctx,
+                    PlaceholderUsageMap &phUsage);
+  void addPlaceholderUsageCount(std::string functionName,
+                                PlaceholderUsageMap &phUsage);
+};
+
+class NNPIDeviceBindings : public DeviceBindings {
+public:
+  NNPIDeviceBindings(std::shared_ptr<InferenceContext> &infCtx)
+      : DeviceBindings("NNPI"), infCtx_(infCtx) {}
+
+  virtual ~NNPIDeviceBindings() {}
+
+  std::unique_ptr<DeviceBindings> clone() override {
+    return std::make_unique<NNPIDeviceBindings>(infCtx_);
+  }
+
+  std::shared_ptr<InferenceContext> getInferenceContext() const {
+    return infCtx_;
+  }
+
+private:
+  std::shared_ptr<InferenceContext> infCtx_;
 };
 
 DeviceManager *createNNPIDeviceManager(const DeviceConfig &config,

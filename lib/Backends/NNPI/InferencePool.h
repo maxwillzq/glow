@@ -20,6 +20,7 @@
 #include "NNPICompiledFunction.h"
 #include "NNPITracing.h"
 #include "folly/executors/CPUThreadPoolExecutor.h"
+#include "glow/ExecutionContext/ExecutionContext.h"
 #include "glow/Runtime/RuntimeTypes.h"
 #include "nnpi_inference.h"
 #include "nnpi_transformer.h"
@@ -30,28 +31,33 @@
 
 namespace glow {
 namespace runtime {
-
+class NNPIDeviceBindings;
 class InferencePoolEnv {
-  unsigned numWorkers_;
   std::unique_ptr<folly::CPUThreadPoolExecutor> workersPool_;
   std::vector<InferenceContext> inferenceContexts_;
   std::vector<InferenceContext *> freeContexts_;
   std::mutex freeContextsLock_;
-  NNPIHostNetwork hostNetwork_;
   NNPIDeviceNetwork deviceNetwork_;
-  std::shared_ptr<NNPIDeviceTracing> deviceTracing_;
   std::shared_ptr<NNPIDeviceOptions> deviceOptions_;
   unsigned deviceId_;
+  ResourceDescVec inputDesc_;
+  ResourceDescVec outputDesc_;
+  NNPIAdapter adapter_;
+  NNPIDeviceContext device_;
+  NNPICompiledFunction *nnpiCompiledFunction_;
+  StaticPlaceholderMap *staticPlaceholderMap_;
+  std::string functionName_;
 
 public:
   InferencePoolEnv();
   ~InferencePoolEnv();
-  Error init(unsigned numWorkers, NNPIAdapter adapter, NNPIDeviceContext device,
-             std::shared_ptr<NNPIDeviceTracing> deviceTracing,
+  Error init(NNPIAdapter adapter, NNPIDeviceContext device,
              CompiledFunction *compiledFunction,
              StaticPlaceholderMap *staticPlaceholderMap,
              std::shared_ptr<NNPIDeviceOptions> deviceOptions,
              const std::string &functionName, unsigned deviceId);
+  InferenceContext *
+  createDetachedInferenceContext(PlaceholderUsageMap &phUsage);
   void stop(bool block);
   void execute(RunIdentifierTy runId, std::unique_ptr<ExecutionContext> ctx,
                runtime::ResultCBTy resultCB);

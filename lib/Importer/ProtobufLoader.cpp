@@ -35,6 +35,14 @@ bool isArrayConstant(llvm::ArrayRef<size_t> a) {
   return true;
 }
 
+Expected<int> getPositiveAxis(int axis, int rank) {
+  RETURN_ERR_IF_NOT(
+      (-rank <= axis) && (axis < rank),
+      strFormat("Axis value %d is invalid! Should be in the range [%d, %d]!",
+                axis, -rank, rank - 1));
+  return (axis < 0) ? axis + rank : axis;
+}
+
 void setConstantFoldLoaderOpsFlag(bool flag) { isConstFoldLoaderOps = flag; }
 
 bool getConstantFoldLoaderOpsFlag() { return isConstFoldLoaderOps; }
@@ -223,6 +231,10 @@ ProtobufLoader::createAndRegisterPlaceholder(llvm::StringRef name, TypeRef T,
   RETURN_ERR_IF_NOT(
       !hasNodeByName(name),
       llvm::Twine("Creating an already existing node ", name).str());
+  RETURN_ERR_IF_NOT(!mod_.hasStorageName(name),
+                    strFormat("A Placeholder was already registered by name %s",
+                              name.data()));
+
   Placeholder *node = mod_.createPlaceholder(T, name, isTrainable, layout);
   node->setStatic(isStatic);
   nodeValueByName_[name] = node->getOutput();
@@ -235,15 +247,16 @@ bool ProtobufLoader::hasNodeByName(llvm::StringRef name) const {
 
 ProtobufLoader::ProtobufLoader(llvm::ArrayRef<const char *> tensorNames,
                                llvm::ArrayRef<TypeRef> types, Module &mod,
-                               Error *errPtr)
-    : G_(nullptr), mod_(mod) {
+                               Error *errPtr, bool loadIntoExistingModule)
+    : G_(nullptr), mod_(mod), loadIntoExistingModule_(loadIntoExistingModule) {
   setupLoader(tensorNames, types, errPtr);
 }
 
 ProtobufLoader::ProtobufLoader(llvm::ArrayRef<const char *> tensorNames,
                                llvm::ArrayRef<TypeRef> types, Function *F,
-                               Error *errPtr)
-    : G_(F), mod_(*F->getParent()) {
+                               Error *errPtr, bool loadIntoExistingModule)
+    : G_(F), mod_(*F->getParent()),
+      loadIntoExistingModule_(loadIntoExistingModule) {
   setupLoader(tensorNames, types, errPtr);
 }
 

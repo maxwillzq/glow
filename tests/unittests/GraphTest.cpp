@@ -94,6 +94,36 @@ TEST(Graph, clear) {
   EXPECT_EQ(M.getFunctions().size(), 0);
 }
 
+/// Check that the clear method works as expected.
+TEST(Graph, clearFunctions) {
+  Module M;
+
+  // Check that the module is initially empty.
+  EXPECT_EQ(M.getConstants().size(), 0);
+  EXPECT_EQ(M.getPlaceholders().size(), 0);
+  EXPECT_EQ(M.getFunctions().size(), 0);
+
+  // Create a few things.
+  Function *F = M.createFunction("main");
+  auto *PH = M.createPlaceholder(ElemKind::FloatTy, {1}, "placeholder", true);
+  auto *C = M.createConstant(ElemKind::FloatTy, {1}, "var");
+  auto *AN = F->createAdd("add", PH, C);
+  F->createSave("save", AN);
+
+  EXPECT_EQ(M.getConstants().size(), 1);
+  EXPECT_EQ(M.getPlaceholders().size(), 2); // Input PH and PH for Save
+  EXPECT_EQ(M.getFunctions().size(), 1);
+  EXPECT_EQ(F->getNodes().size(), 2); // Add, Save
+
+  M.clearFunctions();
+  EXPECT_EQ(M.getConstants().size(), 1);
+  EXPECT_EQ(M.getPlaceholders().size(), 2);
+  ASSERT_EQ(M.getFunctions().size(), 1);
+  // Same Function ptr should exist, just nothing left in them.
+  EXPECT_EQ(*M.getFunctions().begin(), F);
+  EXPECT_EQ(F->getNodes().size(), 0);
+}
+
 /// Test the graph nodes names and utilities.
 TEST(Graph, testGraphNames) {
   Module MD;
@@ -106,7 +136,7 @@ TEST(Graph, testGraphNames) {
   auto *top = F->createTopK("top", add, 5);
   Node *save = F->createSave("out", top->getValues());
 
-  EXPECT_TRUE(MD.getPlaceholderByName("op1"));
+  EXPECT_TRUE(MD.getPlaceholderByNameSlow("op1"));
   EXPECT_TRUE(MD.getConstantByName("op2"));
   EXPECT_TRUE(F->getNodeByName("add"));
   EXPECT_TRUE(F->getNodeByName("top"));
@@ -595,7 +625,7 @@ TEST(Graph, quantizeDequantizeNodes) {
       F->getParent()->uniqueType(ElemKind::Int8QTy, {1, 3}, 1.4, 3);
   auto *A = F->createRescaleQuantized("rescale", Q, transform);
 
-  auto *D = F->createDequantize("dequantize", A);
+  auto *D = F->createDequantize("dequantize", A, ElemKind::FloatTy);
   PlaceholderBindings bindings;
   F->createSave("ret", D);
   EE.compile(CompilationMode::Infer);
@@ -701,8 +731,10 @@ static void compileAndRun(ExecutionEngine &EE, PlaceholderBindings &bindings,
                           llvm::StringRef outputName) {
   EE.compile(glow::CompilationMode::Infer);
   // Allocate stprage for placeholders and initialize inputs.
-  bindings.allocate(M.getPlaceholderByName(inputName))->getHandle().clear(2.0);
-  bindings.allocate(M.getPlaceholderByName(outputName));
+  bindings.allocate(M.getPlaceholderByNameSlow(inputName))
+      ->getHandle()
+      .clear(2.0);
+  bindings.allocate(M.getPlaceholderByNameSlow(outputName));
   EE.run(bindings);
 }
 
@@ -758,7 +790,7 @@ TEST(Graph, moduleCloneTest) {
     compileAndRun(originalEE, originalBindings, originalM, "input", resultName);
     // Store the result of running the original module.
     originalResult.assign(originalBindings.get(
-        originalBindings.getPlaceholderByName(resultName)));
+        originalBindings.getPlaceholderByNameSlow(resultName)));
     // The old module should be removed when this scope ends. Thus, if the
     // cloned module newM refers to any deleted nodes from the original module,
     // it would result in a dangling reference and most likely in a crash.
@@ -770,7 +802,7 @@ TEST(Graph, moduleCloneTest) {
   compileAndRun(clonedEE, clonedBindings, clonedM, "input", resultName);
   // Store the result of running the cloned module.
   clonedResult.assign(
-      clonedBindings.get(clonedBindings.getPlaceholderByName(resultName)));
+      clonedBindings.get(clonedBindings.getPlaceholderByNameSlow(resultName)));
   // The results of execution should be exactly the same in both cases.
   EXPECT_TRUE(originalResult.isEqual(clonedResult, 0));
 }
@@ -959,7 +991,8 @@ TEST(Graph, schedulingOfSavesOrderProvided) {
   auto *addAB = F->createAdd("addAB", A, B);
 
   auto *saveNode = F->createSave("ret", addAB);
-  bindings.allocate(saveNode->getPlaceholder());
+  auto *savePH = saveNode->getPlaceholder();
+  bindings.allocate(savePH);
   F->createSave("resetA", zero, A);
 
   // Copy the value of A.
@@ -968,7 +1001,7 @@ TEST(Graph, schedulingOfSavesOrderProvided) {
   EE.compile(CompilationMode::Infer);
 
   EE.run(bindings);
-  auto *ret = bindings.get(saveNode->getPlaceholder());
+  auto *ret = bindings.get(savePH);
   auto handleAOrig = AOrig.getHandle<>();
   auto handleB = bindings.get(B)->getHandle<>();
   auto handleRet = ret->getHandle<>();
@@ -1010,11 +1043,11 @@ TEST(Graph, schedulingOfSaves) {
 
   // Copy the value of A.
   Tensor AOrig = bindings.get(A)->clone();
-
+  auto *ret = saveNode->getPlaceholder();
   EE.compile(CompilationMode::Infer);
 
   EE.run(bindings);
-  auto *ret = saveNode->getPlaceholder();
+
   auto handleAOrig = AOrig.getHandle<>();
   auto handleB = bindings.get(B)->getHandle<>();
   auto handleRet = bindings.get(ret)->getHandle<>();
@@ -1745,6 +1778,7 @@ TEST(Graph, clonePlaceholderBindingsRuns) {
   auto *FCL1 = F->createFullyConnected(bindings, "fc", input, 10);
   auto *RL3 = F->createRELU("relu4", FCL1);
   auto *save = F->createSave("ret", RL3);
+  auto *savePH = save->getPlaceholder();
 
   bindings.allocate(save->getPlaceholder());
 
@@ -1761,8 +1795,8 @@ TEST(Graph, clonePlaceholderBindingsRuns) {
 
   // PlaceholderBindingss are identical.
   Tensor *saveBacking1, *saveBacking2;
-  saveBacking1 = bindings.get(save->getPlaceholder());
-  saveBacking2 = bindings2.get(save->getPlaceholder());
+  saveBacking1 = bindings.get(savePH);
+  saveBacking2 = bindings2.get(savePH);
   EXPECT_NE(saveBacking1, saveBacking2);
   EXPECT_EQ(saveBacking1->size(), saveBacking2->size());
   EXPECT_TRUE(saveBacking1->isEqual(*saveBacking2));
@@ -1965,6 +1999,7 @@ name : "input"
 layout : *
 output : float<4 x 320 x 200 x 100 x 3>
 trainable : 1
+static : 0
 users : 0
 )";
   EXPECT_EQ(mesN, expectMes);
@@ -1976,6 +2011,7 @@ users : 0
   // Test Function
   Placeholder *I =
       MD.createPlaceholder(ElemKind::FloatTy, {10, 10}, "input", true);
+  I->setStatic(true);
   Function *F2 = MD.createFunction("F2");
   F2->createTopK("topk", I, 3);
   std::string storageF1;
@@ -1995,6 +2031,7 @@ name : "input__1"
 layout : *
 output : float<10 x 10>
 trainable : 1
+static : 1
 users : 1
 )";
   EXPECT_EQ(mesF, expectMesF);
@@ -2019,6 +2056,7 @@ name : "input__1"
 layout : *
 output : float<10 x 10>
 trainable : 1
+static : 1
 )";
   EXPECT_EQ(mesF, expectMesF);
   EXPECT_EQ(mesF, osF1.str());
@@ -2040,6 +2078,7 @@ name : "input__1"
 layout : *
 output : float<10 x 10>
 trainable : 1
+static : 1
 users : 1
 
 Placeholder
@@ -2047,6 +2086,7 @@ name : "input"
 layout : *
 output : float<4 x 320 x 200 x 100 x 3>
 trainable : 1
+static : 0
 users : 0
 
 Function : F2

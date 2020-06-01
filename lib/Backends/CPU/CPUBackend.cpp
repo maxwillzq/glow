@@ -82,6 +82,7 @@ bool CPUBackend::isOpSupported(const NodeInfo &NI) const {
             NI.getOutElemTy(ArgMaxNode::ArgmaxIdx) == ElemKind::Int32ITy);
 
   case Kinded::Kind::ResizeNearestNodeKind:
+  case Kinded::Kind::ResizeBilinearNodeKind:
     return NI.allInputsAndOutputsHaveSameElemKind(
         {ElemKind::FloatTy, ElemKind::Int8QTy, ElemKind::Int32QTy,
          ElemKind::Int32ITy, ElemKind::Int64ITy});
@@ -99,6 +100,7 @@ bool CPUBackend::isOpSupported(const NodeInfo &NI) const {
     // Concat ==> Splat + Insert. Both only support the following.
   case Kinded::Kind::ConcatNodeKind:
   case Kinded::Kind::SplatNodeKind:
+  case Kinded::Kind::TouchNodeKind:
     return NI.allInputsAndOutputsHaveSameElemKind(
         {ElemKind::FloatTy, ElemKind::Int8QTy, ElemKind::Int64ITy,
          ElemKind::Int32ITy, ElemKind::BoolTy});
@@ -246,6 +248,30 @@ bool CPUBackend::isOpSupported(const NodeInfo &NI) const {
                                                   {ConvolutionNode::BiasIdx}) &&
            (NI.getInElemTy(ConvolutionNode::BiasIdx) == ElemKind::Int8QTy ||
             NI.getInElemTy(ConvolutionNode::BiasIdx) == ElemKind::Int32QTy);
+
+  case Kinded::Kind::ChannelwiseQuantizedConvolutionNodeKind:
+    return (NI.getInElemTy(ChannelwiseQuantizedConvolutionNode::InputIdx) ==
+            ElemKind::Int8QTy) &&
+           (NI.getInElemTy(ChannelwiseQuantizedConvolutionNode::FilterIdx) ==
+            ElemKind::Int8QTy) &&
+           ((NI.getInElemTy(ChannelwiseQuantizedConvolutionNode::BiasIdx) ==
+             ElemKind::Int8QTy) ||
+            (NI.getInElemTy(ChannelwiseQuantizedConvolutionNode::BiasIdx) ==
+             ElemKind::Int32QTy)) &&
+           (NI.getInElemTy(
+                ChannelwiseQuantizedConvolutionNode::FilterScalesIdx) ==
+            ElemKind::FloatTy) &&
+           (NI.getInElemTy(
+                ChannelwiseQuantizedConvolutionNode::FilterOffsetsIdx) ==
+            ElemKind::Int32ITy) &&
+           (NI.getInElemTy(
+                ChannelwiseQuantizedConvolutionNode::BiasScalesIdx) ==
+            ElemKind::FloatTy) &&
+           (NI.getInElemTy(
+                ChannelwiseQuantizedConvolutionNode::BiasOffsetsIdx) ==
+            ElemKind::Int32ITy) &&
+           (NI.getOutElemTy(ChannelwiseQuantizedConvolutionNode::ResultIdx) ==
+            ElemKind::Int8QTy);
 
   case Kinded::Kind::ConvTransposeNodeKind:
     // TODO - not quantized support yet in libjit.

@@ -107,7 +107,8 @@ TEST_F(NNPIOptPipelineTest, RemoveClipBlockingFCReluFusion) {
 
   cloneAndCompile();
 
-  EXPECT_EQ(optimizedF_->getNodes().size(), 4);
+  // (Clip -> Relu -> Clip) -> Clip
+  EXPECT_EQ(optimizedF_->getNodes().size(), 3);
 
   SaveNode *optSave = nullptr;
   for (auto &N : optimizedF_->getNodes()) {
@@ -124,9 +125,8 @@ TEST_F(NNPIOptPipelineTest, RemoveClipBlockingFCReluFusion) {
     // Note: Min here is 0, because relu changed the Clip's min range.
     EXPECT_EQ(clipRelu->getMin(), 0);
     EXPECT_EQ(clipRelu->getMax(), float16Max);
-    ReluNode *RN = llvm::dyn_cast<ReluNode>(clipRelu->getInput());
-    ASSERT_TRUE(RN);
-    FullyConnectedNode *FC = llvm::dyn_cast<FullyConnectedNode>(RN->getInput());
+    FullyConnectedNode *FC =
+        llvm::dyn_cast<FullyConnectedNode>(clipRelu->getInput());
     ASSERT_TRUE(FC);
   }
 
@@ -207,7 +207,8 @@ TEST_F(NNPIOptPipelineTest, SplitParallelizationTestFCReluClipNNPI) {
   EXPECT_EQ(countNodeKind(optimizedF_, Kinded::Kind::FullyConnectedNodeKind),
             8);
   EXPECT_EQ(countNodeKind(F_, Kinded::Kind::ReluNodeKind), 1);
-  EXPECT_EQ(countNodeKind(optimizedF_, Kinded::Kind::ReluNodeKind), 8);
+  // Note: FC->Relu->Clip is optimized to FC->Clip, so no Relu is left.
+  EXPECT_EQ(countNodeKind(optimizedF_, Kinded::Kind::ReluNodeKind), 0);
   EXPECT_EQ(countNodeKind(F_, Kinded::Kind::ClipNodeKind), 1);
   EXPECT_EQ(countNodeKind(optimizedF_, Kinded::Kind::ClipNodeKind), 8);
 
@@ -384,8 +385,10 @@ TEST_F(NNPIOptPipelineTest, SplitParallelizationTestTanhReluNNPI) {
 static void setupSplitParallelizationTestFCReluNNPI(
     Module &mod_, Function *F_, CompilationContext &cctx_,
     PlaceholderBindings &bindings_, const std::string &parKind) {
-  auto *input =
-      mod_.createPlaceholder(ElemKind::Float16Ty, {512, 32}, "input", false);
+  auto *input1 =
+      mod_.createPlaceholder(ElemKind::Float16Ty, {512, 32}, "input1", false);
+  auto *input2 =
+      mod_.createPlaceholder(ElemKind::Float16Ty, {512, 32}, "input2", false);
   auto *weights = F_->getParent()->createConstant(ElemKind::Float16Ty,
                                                   {512, 512}, "weights");
   auto *bias =
@@ -395,14 +398,20 @@ static void setupSplitParallelizationTestFCReluNNPI(
   bias->getPayloadMutable().getHandle<float16_t>().randomize(-1.0, 1.0,
                                                              mod_.getPRNG());
 
-  auto *TN = F_->createTranspose("transpose", input, {1, 0});
+  auto *CI = F_->createConcat("concat", {input1, input2}, 1);
+  auto *TN = F_->createTranspose("transpose", CI, {1, 0});
   auto *FC = F_->createFullyConnected("fc", TN, weights, bias);
   auto *RN = F_->createRELU("relu", FC);
   auto *SN = F_->createSigmoid("sigmoid", RN);
   F_->createSave("ret", SN);
 
-  bindings_.allocate(input)->getHandle<float16_t>().randomize(-1.0, 1.0,
-                                                              mod_.getPRNG());
+  auto *AN = F_->createAdd("add", input1, input2);
+  F_->createSave("add_save", AN);
+
+  bindings_.allocate(input1)->getHandle<float16_t>().randomize(-1.0, 1.0,
+                                                               mod_.getPRNG());
+  bindings_.allocate(input2)->getHandle<float16_t>().randomize(-1.0, 1.0,
+                                                               mod_.getPRNG());
 
   auto &nodeInfo = cctx_.backendOpts.backendSpecificNodeInfo[F_];
   // Setup some parallelization.
@@ -411,10 +420,16 @@ static void setupSplitParallelizationTestFCReluNNPI(
   nodeInfo[RN]["NNPI_numParallelChunks"].push_back("8");
   nodeInfo[RN]["NNPI_parallelTransformKind"].push_back(parKind);
   // Add some extra edges.
+  nodeInfo[AN]["NNPI_extraEdges"].push_back(CI->getName().str() + "@1");
+  nodeInfo[CI]["NNPI_extraEdges"].push_back("1$" + TN->getName().str());
+  nodeInfo[CI]["NNPI_extraEdges"].push_back("1$" + FC->getName().str() + "@3");
+  nodeInfo[AN]["NNPI_extraEdges"].push_back(CI->getName().str() + "@1");
   nodeInfo[TN]["NNPI_extraEdges"].push_back(FC->getName().str() + "@3");
   nodeInfo[TN]["NNPI_extraEdges"].push_back(FC->getName().str() + "@7");
+  nodeInfo[FC]["NNPI_extraEdges"].push_back("2$" + RN->getName().str() + "@7");
   nodeInfo[RN]["NNPI_extraEdges"].push_back(SN->getName().str());
   nodeInfo[TN]["NNPI_extraEdges"].push_back(SN->getName().str());
+  nodeInfo[AN]["NNPI_extraEdges"].push_back(TN->getName().str());
   // Assign some ops to cores.
   nodeInfo[TN]["NNPI_coreAssignments"].push_back("3");
   nodeInfo[FC]["NNPI_coreAssignments"].push_back("2");
@@ -424,7 +439,7 @@ static void setupSplitParallelizationTestFCReluNNPI(
   nodeInfo[FC]["NNPI_coreAssignments"].push_back("1");
   nodeInfo[FC]["NNPI_coreAssignments"].push_back("7");
   nodeInfo[FC]["NNPI_coreAssignments"].push_back("3");
-  nodeInfo[FC]["NNPI_coreAssignments"].push_back("4");
+  nodeInfo[FC]["NNPI_coreAssignments"].push_back("0");
 }
 
 /// Test model parallel splitting inside of NNPIPrivateTransforms.cpp for
@@ -440,7 +455,7 @@ TEST_F(NNPIOptPipelineTestNodeOpts, ModelSplitParallelizationTestFCReluNNPI) {
             8);
   EXPECT_EQ(countNodeKind(unoptimizedF_, Kinded::Kind::ReluNodeKind), 1);
   EXPECT_EQ(countNodeKind(optimizedF_, Kinded::Kind::ReluNodeKind), 8);
-  EXPECT_EQ(countNodeKind(optimizedF_, Kinded::Kind::ConcatNodeKind), 1);
+  EXPECT_EQ(countNodeKind(optimizedF_, Kinded::Kind::ConcatNodeKind), 2);
 
   SaveNode *optSave = nullptr;
   for (auto &N : optimizedF_->getNodes()) {
@@ -472,7 +487,7 @@ TEST_F(NNPIOptPipelineTestNodeOpts, DataSplitParallelizationTestFCReluNNPI) {
             8);
   EXPECT_EQ(countNodeKind(unoptimizedF_, Kinded::Kind::ReluNodeKind), 1);
   EXPECT_EQ(countNodeKind(optimizedF_, Kinded::Kind::ReluNodeKind), 8);
-  EXPECT_EQ(countNodeKind(optimizedF_, Kinded::Kind::ConcatNodeKind), 1);
+  EXPECT_EQ(countNodeKind(optimizedF_, Kinded::Kind::ConcatNodeKind), 2);
 
   SaveNode *optSave = nullptr;
   for (auto &N : optimizedF_->getNodes()) {

@@ -148,6 +148,17 @@ Function::broadcastInputs(int axis, const llvm::ArrayRef<NodeValue> inputs) {
 
 bool Module::hasFunction(llvm::StringRef name) { return getFunction(name); }
 
+void Module::clearFunctions() {
+  for (auto *F : functions_) {
+    F->clear();
+  }
+}
+
+void Function::clear() {
+  nodes_.clear();
+  uniqueNodeNames_.clear();
+}
+
 Function *Module::getFunction(llvm::StringRef name) {
   for (auto *F : functions_) {
     if (F->getName() == name) {
@@ -222,12 +233,16 @@ bool Module::verify() const {
 
 void Module::dump() const {
   llvm::outs() << "Module structure:\n";
-  for (auto v : getConstants()) {
-    llvm::outs() << v->getDebugDesc() << "\n";
+  for (auto *C : getConstants()) {
+    llvm::outs() << C->getDebugDesc() << "\n";
   }
 
-  for (auto f : functions_) {
-    llvm::outs() << "Function:" << f->getName() << "\n";
+  for (auto *P : getPlaceholders()) {
+    llvm::outs() << P->getDebugDesc() << "\n";
+  }
+
+  for (auto *F : functions_) {
+    llvm::outs() << "Function:" << F->getName() << "\n";
   }
 }
 
@@ -817,6 +832,26 @@ Convolution3DNode *Function::createConv3D(llvm::StringRef name, NodeValue input,
                                           unsigned_t group) {
   assertConv3DDims(input, filter, bias, kernels, strides, pads, group);
   auto OT = getParent()->uniqueType(*outTy);
+
+  // If the input is quantized but the bias is not then auto-quantize the
+  // bias.
+  if (input.getType()->isQuantizedType()) {
+    auto biasType = bias.getElementType();
+    if (biasType == ElemKind::Int32QTy || biasType == ElemKind::Int8QTy ||
+        biasType == ElemKind::Int16QTy) {
+      // Nothing to do
+    } else if (biasType == ElemKind::FloatTy) {
+      auto biasTy = getParent()->uniqueType(
+          glow::ElemKind::Int32QTy, bias.dims(),
+          input.getType()->getScale() * filter.getType()->getScale(),
+          /* offset */ 0);
+      bias = createQuantize("quantized_bias", bias, biasTy);
+    } else {
+      LOG(DFATAL)
+          << "Unsupported element type for bias of quantized convolution: "
+          << Type::getElementName(biasType).str();
+    }
+  }
   return addNode(new Convolution3DNode(name, OT, input, filter, bias, kernels,
                                        strides, pads, group));
 }
@@ -1087,6 +1122,10 @@ SigmoidNode *Function::createSigmoid(llvm::StringRef name, TypeRef outTy,
 
 SigmoidNode *Function::createSigmoid(llvm::StringRef name, NodeValue input) {
   return createSigmoid(name, input.getType(), input);
+}
+
+SwishNode *Function::createSwish(llvm::StringRef name, NodeValue input) {
+  return addNode(new SwishNode(name, input.getType(), input));
 }
 
 TanhNode *Function::createTanh(llvm::StringRef name, TypeRef outTy,
@@ -1588,30 +1627,9 @@ ExpNode *Function::createExp(llvm::StringRef name, NodeValue input) {
   return addNode(new ExpNode(name, input.getType(), input));
 }
 
-Node *Function::createLogit(llvm::StringRef name, NodeValue input, float eps) {
-  assert(eps > 0.0f && "Clamping parameter eps must be strictly positive.");
-  assert(eps < 0.5f && "Clamping parameter eps must be less than 0.5.");
-
-  // Compute clamped x using clip(x, eps, 1 - eps).
-  auto epsComplement = 1.0f - eps;
-  auto *MaxN = createClip(name.str() + ".clip", input, eps, epsComplement);
-
-  // Compute the logit transform of clamped x,
-  // log(numerator / denominator),
-  // where numerator = clamped x = MaxN,
-  // and denominator = 1 - clamped x = 1 - MaxN.
-
-  // Compute denominator = 1 - clamped x.
-  auto *onesSplat =
-      createSplat(name.str() + ".onesSplat", input.getType(), 1.0f);
-
-  auto *SN = createSub(name.str() + ".sub", onesSplat, MaxN);
-
-  // Compute the quotient = numerator / denominator.
-  auto *DN = createDiv(name.str() + ".div", MaxN, SN);
-
-  // Compute and return the logit transform (the final node).
-  return createLog(name.str() + ".log", DN);
+LogitNode *Function::createLogit(llvm::StringRef name, NodeValue input,
+                                 float eps) {
+  return addNode(new LogitNode(name, input.getType(), input, eps));
 }
 
 SelectNode *Function::createSelect(llvm::StringRef name, TypeRef outTy,
@@ -1636,6 +1654,10 @@ SelectNode *Function::createSelect(llvm::StringRef name, NodeValue Cond,
 SplatNode *Function::createSplat(llvm::StringRef name, TypeRef ty,
                                  float value) {
   return addNode(new SplatNode(name, getParent()->uniqueType(*ty), value));
+}
+
+TouchNode *Function::createTouch(llvm::StringRef name, TypeRef ty) {
+  return addNode(new TouchNode(name, getParent()->uniqueType(*ty)));
 }
 
 MatMulNode *Function::createMatMul(llvm::StringRef name, TypeRef outTy,
@@ -1743,14 +1765,14 @@ Function::createBatchedReduceMin(llvm::StringRef name, NodeValue batch,
 }
 
 BatchedAddNode *Function::createBatchedAdd(llvm::StringRef name,
-                                           NodeValue batch, NodeValue sample) {
-  return addNode(new BatchedAddNode(name, batch.getType(), batch, sample));
+                                           NodeValue batch, NodeValue slice) {
+  return addNode(new BatchedAddNode(name, batch.getType(), batch, slice));
 }
 
 BatchedAddNode *Function::createBatchedAdd(llvm::StringRef name, TypeRef outTy,
-                                           NodeValue batch, NodeValue sample) {
+                                           NodeValue batch, NodeValue slice) {
   return addNode(
-      new BatchedAddNode(name, getParent()->uniqueType(*outTy), batch, sample));
+      new BatchedAddNode(name, getParent()->uniqueType(*outTy), batch, slice));
 }
 
 CumSumNode *Function::createCumSum(llvm::StringRef name, NodeValue input,
@@ -2118,11 +2140,10 @@ SaveNode *Function::createSave(llvm::StringRef name, NodeValue input,
 
 QuantizationProfileNode *
 Function::createQuantizationProfile(PlaceholderBindings &bindings,
-                                    llvm::StringRef name, NodeValue input) {
-  // TODO: this size is going to be refined. Just a placeholder now.
-  const dim_t numberOfBuckets = 2000U;
+                                    llvm::StringRef name, NodeValue input,
+                                    dim_t numHistogramBins) {
   auto *histogram = getParent()->createPlaceholder(
-      ElemKind::FloatTy, {numberOfBuckets}, "histogram_" + name.str(), false);
+      ElemKind::FloatTy, {numHistogramBins}, "histogram_" + name.str(), false);
   bindings.allocate(histogram)->zero();
   // Intermediate data used for histogram calculations.
   // Min tensor value seen so far is kept on the first position.
@@ -2321,6 +2342,67 @@ ResizeNearestNode *Function::createResizeNearest(llvm::StringRef name,
   return addNode(new ResizeNearestNode(name, outTy, input, scale));
 }
 
+ResizeNearestNode *Function::createResizeNearest(llvm::StringRef name,
+                                                 NodeValue input,
+                                                 TypeRef outTy) {
+  auto inputDim = input.dims();
+  auto outputDim = outTy->dims();
+  DCHECK_EQ(inputDim.size(), outputDim.size())
+      << "Input dimension size: " << inputDim.size()
+      << " output dimension size: " << outputDim.size() << " should be same.";
+
+  std::vector<float> scales;
+  for (size_t i = 0; i < inputDim.size(); i++) {
+    float scale = (outputDim[i] / (float)inputDim[i]);
+    DCHECK_GT(scale, 0.0) << "Scale: " << scale
+                          << ", Scale larger than 0 is expected.";
+    scales.push_back(scale);
+  }
+
+  return addNode(new ResizeNearestNode(name, outTy, input, scales));
+}
+
+ResizeBilinearNode *
+Function::createResizeBilinear(llvm::StringRef name, NodeValue input,
+                               llvm::ArrayRef<float> scale) {
+  auto inputDim = input.dims();
+  DCHECK_EQ(inputDim.size(), scale.size())
+      << "Input Dimension size: " << inputDim.size()
+      << " Scale size: " << scale.size() << " should be same.";
+
+  std::vector<dim_t> newDim;
+
+  for (size_t i = 0; i < scale.size(); i++) {
+    auto newD = dim_t(std::floor(inputDim[i] * scale[i]));
+    DCHECK_GT(newD, 0) << "Scaled dim is " << newD
+                       << ", Scaled value needs to be larger than 0.";
+    newDim.push_back(newD);
+  }
+
+  auto outTy = getParent()->uniqueTypeWithNewShape(input.getType(), newDim);
+  return addNode(new ResizeBilinearNode(name, outTy, input, scale));
+}
+
+ResizeBilinearNode *Function::createResizeBilinear(llvm::StringRef name,
+                                                   NodeValue input,
+                                                   TypeRef outTy) {
+  auto inputDim = input.dims();
+  auto outputDim = outTy->dims();
+  DCHECK_EQ(inputDim.size(), outputDim.size())
+      << "Input dimension size: " << inputDim.size()
+      << " output dimension size: " << outputDim.size() << " should be same.";
+
+  std::vector<float> scales;
+  for (size_t i = 0; i < inputDim.size(); i++) {
+    float scale = (outputDim[i] / (float)inputDim[i]);
+    DCHECK_GT(scale, 0.0) << "Scale: " << scale
+                          << ", Scale larger than 0 is expected.";
+    scales.push_back(scale);
+  }
+
+  return addNode(new ResizeBilinearNode(name, outTy, input, scales));
+}
+
 QuantizeNode *Function::createQuantize(llvm::StringRef name, NodeValue input,
                                        TypeRef outTy) {
   assert(input.getType()->isFPType() && "Input must be a floating type");
@@ -2333,11 +2415,18 @@ QuantizeNode *Function::createQuantize(llvm::StringRef name, NodeValue input,
 }
 
 DequantizeNode *Function::createDequantize(llvm::StringRef name,
-                                           NodeValue input) {
+                                           NodeValue input, ElemKind k) {
   assert(input.getType()->isQuantizedType() &&
          "Input must be a quantized type");
-  TypeRef outTy =
-      getParent()->uniqueType(Type(ElemKind::FloatTy, input.dims()));
+  assert(isFloatElemKind(k) && "Result must be float type.");
+  ShapeVector outShape(input.dims().begin(), input.dims().end());
+  if (input.getElementType() == ElemKind::UInt8FusedQTy) {
+    assert(outShape.size() == 2 && "Fused tensors should be 2D");
+    assert(outShape[1] > 2 * sizeof(float) &&
+           "Expected space for per-row scale/offset");
+    outShape[1] -= 2 * sizeof(float);
+  }
+  TypeRef outTy = getParent()->uniqueType(Type(k, outShape));
   return createDequantize(name, input, outTy);
 }
 
@@ -2588,72 +2677,164 @@ Convolution3DNode *Function::createConv3D(PlaceholderBindings &bindings,
 
 ChannelwiseQuantizedConvolutionNode *Function::createChannelwiseQuantizedConv(
     llvm::StringRef name, NodeValue input, NodeValue filter, NodeValue bias,
-    NodeValue scales, NodeValue offsets, TypeRef outTy,
-    llvm::ArrayRef<unsigned_t> kernels, llvm::ArrayRef<unsigned_t> strides,
-    llvm::ArrayRef<unsigned_t> pads, unsigned_t group) {
-  assertConvDims(input, filter, bias, kernels, strides, pads, group);
-  auto OT = getParent()->uniqueType(*outTy);
-  auto biasElemKind = bias.getElementType();
+    NodeValue filterScales, NodeValue filterOffsets, NodeValue biasScales,
+    NodeValue biasOffsets, TypeRef outTy, llvm::ArrayRef<unsigned_t> kernels,
+    llvm::ArrayRef<unsigned_t> strides, llvm::ArrayRef<unsigned_t> pads,
+    unsigned_t group, unsigned_t dilation, bool quantizeFilter,
+    bool quantizeBias, quantization::Schema schema, ElemKind filterElemQTy,
+    ElemKind biasElemQTy) {
 
-  if (biasElemKind != ElemKind::Int32QTy && biasElemKind != ElemKind::FloatTy) {
-    LOG(DFATAL)
-        << "Unsupported element type for ChannelwiseQuantizedConvolution bias: "
-        << Type::getElementName(biasElemKind).str();
+  // Validate dimensions.
+  bool isConv3D = (input.getType()->dims().size() == 5);
+  if (isConv3D) {
+    assertConv3DDims(input, filter, bias, kernels, strides, pads, group);
+  } else {
+    assertConvDims(input, filter, bias, kernels, strides, pads, group);
   }
 
+  // Validate bias precision.
+  auto biasElemKind = bias.getElementType();
+  DCHECK(biasElemKind == ElemKind::Int8QTy ||
+         biasElemKind == ElemKind::Int32QTy ||
+         biasElemKind == ElemKind::FloatTy)
+      << "Unsupported element type for ChannelwiseQuantizedConvolution bias: "
+      << Type::getElementName(biasElemKind).str();
+
+  // Validate filter precision.
+  auto filterElemKind = filter.getElementType();
+  DCHECK(filterElemKind == ElemKind::Int8QTy ||
+         filterElemKind == ElemKind::FloatTy)
+      << "Unsupported element type for ChannelwiseQuantizedConvolution "
+      << "filter: " << Type::getElementName(filterElemKind).str();
+
   DCHECK(dyn_cast<Constant>(bias.getNode()))
-      << "bias input to ChannelwiseQuantizedConvolutionNode must be a Constant";
+      << "Bias input to ChannelwiseQuantizedConvolutionNode must be a Constant";
 
   DCHECK(dyn_cast<Constant>(filter.getNode()))
-      << "filter input to ChannelwiseQuantizedConvolutionNode must be a "
+      << "Filter input to ChannelwiseQuantizedConvolutionNode must be a "
          "Constant";
 
-  DCHECK(dyn_cast<Constant>(scales.getNode()))
-      << "scales input to ChannelwiseQuantizedConvolutionNode must a Constant "
-         "in order to quantize the bias";
+  DCHECK(!filterScales.getNode() || dyn_cast<Constant>(filterScales.getNode()))
+      << "Filter scales input to ChannelwiseQuantizedConvolutionNode must be "
+         "null or Constant";
 
-  DCHECK(dyn_cast<Constant>(offsets.getNode()))
-      << "offsets input to ChannelwiseQuantizedConvolutionNode must be a"
-         "Constant";
+  DCHECK(!filterOffsets.getNode() ||
+         dyn_cast<Constant>(filterOffsets.getNode()))
+      << "Filter offsets input to ChannelwiseQuantizedConvolutionNode must be "
+         "null or Constant";
 
-  return addNode(new ChannelwiseQuantizedConvolutionNode(
-      name, OT, input, filter, bias, scales, offsets, kernels, strides, pads,
-      group));
-}
+  DCHECK(!biasScales.getNode() || dyn_cast<Constant>(biasScales.getNode()))
+      << "Bias scales input to ChannelwiseQuantizedConvolutionNode must be "
+         "null or Constant";
 
-ChannelwiseQuantizedConvolutionNode *Function::createChannelwiseQuantizedConv3D(
-    llvm::StringRef name, NodeValue input, NodeValue filter, NodeValue bias,
-    NodeValue scales, NodeValue offsets, TypeRef outTy,
-    llvm::ArrayRef<unsigned_t> kernels, llvm::ArrayRef<unsigned_t> strides,
-    llvm::ArrayRef<unsigned_t> pads, unsigned_t group) {
-  assertConv3DDims(input, filter, bias, kernels, strides, pads, group);
-  auto OT = getParent()->uniqueType(*outTy);
-  auto biasElemKind = bias.getElementType();
+  DCHECK(!biasOffsets.getNode() || dyn_cast<Constant>(biasOffsets.getNode()))
+      << "Bias offsets input to ChannelwiseQuantizedConvolutionNode must be "
+         "null or Constant";
 
-  if (biasElemKind != ElemKind::Int32QTy && biasElemKind != ElemKind::FloatTy) {
-    LOG(DFATAL)
-        << "Unsupported element type for ChannelwiseQuantizedConvolution bias: "
-        << Type::getElementName(biasElemKind).str();
+  // Number of output channels.
+  dim_t numChannels = outTy->dims().back();
+  dim_t qDim = 0;
+  dim_t qStep = 1;
+
+  // If input filter is FLOAT and filterScales/filterOffsets are NOT provided
+  // then compute them automatically for given schema and filterElemQTy.
+  // If input filter is QUANTIZED then filterScales/filterOffsets are mandatory.
+  if (!filterScales.getNode() || !filterOffsets.getNode()) {
+    DCHECK(filterElemKind == ElemKind::FloatTy)
+        << "ChannelwiseQuantizedConvolution: If the input filter is "
+        << "quantized then the filter scales/offsets must be provided!";
+    Constant *filterC = dyn_cast<Constant>(filter.getNode());
+    Constant *filterScalesC = getParent()->createConstant(
+        ElemKind::FloatTy, {numChannels}, "filterScales");
+    Constant *filterOffsetsC = getParent()->createConstant(
+        ElemKind::Int32ITy, {numChannels}, "filterOffsets");
+    // Get filter channelwise TensorQuantizationParams.
+    quantization::getTensorQuantizationParams(
+        filterC->getPayload(), filterScalesC->getPayloadMutable(),
+        filterOffsetsC->getPayloadMutable(), schema, filterElemQTy, qDim,
+        qStep);
+    filterScales = NodeValue(filterScalesC);
+    filterOffsets = NodeValue(filterOffsetsC);
   }
 
-  DCHECK(dyn_cast<Constant>(bias.getNode()))
-      << "bias input to ChannelwiseQuantizedConvolutionNode must be a Constant";
+  // If input filter is FLOAT then quantize channel wise to filterElemQTy.
+  if (quantizeFilter && filterElemKind == ElemKind::FloatTy) {
+    Constant *filterC = dyn_cast<Constant>(filter.getNode());
+    Constant *filterCQ = getParent()->createConstant(
+        filterElemQTy, filterC->getType()->dims(), 1.0, 0, "filter");
+    Constant *filterScalesC = dyn_cast<Constant>(filterScales.getNode());
+    Constant *filterOffsetsC = dyn_cast<Constant>(filterOffsets.getNode());
+    // Quantize filter channelwise.
+    filterCQ->getPayloadMutable() = quantization::quantizeTensor(
+        filterC->getPayload(), filterScalesC->getPayload(),
+        filterOffsetsC->getPayload(), filterElemQTy, qDim, qStep);
+    filter = NodeValue(filterCQ);
+  }
 
-  DCHECK(dyn_cast<Constant>(filter.getNode()))
-      << "filter input to ChannelwiseQuantizedConvolutionNode must be a "
-         "Constant";
+  // If input bias is FLOAT and biasScales/biasOffsets are NOT provided
+  // then compute them automatically for given schema and biasElemQTy.
+  // If input bias is QUANTIZED and biasScales/biasOffsets are NOT provided
+  // then assume the channel wise quantization parameters are implicitly:
+  // biasScales[i] = inputScale * filterScales[i] and biasOffsets[i] = 0.
+  if (!biasScales.getNode() || !biasOffsets.getNode()) {
+    Constant *biasC = dyn_cast<Constant>(bias.getNode());
+    Constant *biasScalesC = getParent()->createConstant(
+        ElemKind::FloatTy, {numChannels}, "biasScales");
+    Constant *biasOffsetsC = getParent()->createConstant(
+        ElemKind::Int32ITy, {numChannels}, "biasOffsets");
+    auto biasScalesH = biasScalesC->getPayload().getHandle<float>();
+    auto biasOffsetsH = biasOffsetsC->getPayload().getHandle<int32_t>();
+    Constant *filterScalesC = dyn_cast<Constant>(filterScales.getNode());
+    Constant *filterOffsetsC = dyn_cast<Constant>(filterOffsets.getNode());
+    auto filterScalesH = filterScalesC->getPayload().getHandle<float>();
+    auto filterOffsetsH = filterOffsetsC->getPayload().getHandle<int32_t>();
+    auto inputScale = input.getType()->getScale();
+    auto inputOffset = input.getType()->getOffset();
+    if (biasElemKind == ElemKind::FloatTy) {
+      // Get bias channelwise TensorQuantizationParams.
+      quantization::getTensorQuantizationParams(
+          biasC->getPayload(), biasScalesC->getPayloadMutable(),
+          biasOffsetsC->getPayloadMutable(), schema, biasElemQTy, qDim, qStep);
+      // Specialize the bias channelwise TensorQuantizationParams.
+      for (dim_t idx = 0; idx < numChannels; idx++) {
+        auto biasTQPNew = specializeBiasQuantizationParams(
+            {biasScalesH.raw(idx), biasOffsetsH.raw(idx)},
+            {inputScale, inputOffset},
+            {filterScalesH.raw(idx), filterOffsetsH.raw(idx)}, schema,
+            biasElemQTy);
+        biasScalesH.raw(idx) = biasTQPNew.scale;
+        biasOffsetsH.raw(idx) = biasTQPNew.offset;
+      }
+    } else {
+      // Set implicit bias channelwise TensorQuantizationParams.
+      for (dim_t idx = 0; idx < numChannels; idx++) {
+        float filterScale = filterScalesH.raw(idx);
+        biasScalesH.raw(idx) = inputScale * filterScale;
+        biasOffsetsH.raw(idx) = 0;
+      }
+    }
+    biasScales = NodeValue(biasScalesC);
+    biasOffsets = NodeValue(biasOffsetsC);
+  }
 
-  DCHECK(dyn_cast<Constant>(scales.getNode()))
-      << "scales input to ChannelwiseQuantizedConvolutionNode must a Constant "
-         "in order to quantize the bias";
+  // If input bias is FLOAT then quantize channel wise to biasElemQTy.
+  if (quantizeBias && biasElemKind == ElemKind::FloatTy) {
+    Constant *biasC = dyn_cast<Constant>(bias.getNode());
+    Constant *biasCQ = getParent()->createConstant(
+        biasElemQTy, biasC->getType()->dims(), 1.0, 0, "bias");
+    Constant *biasScalesC = dyn_cast<Constant>(biasScales.getNode());
+    Constant *biasOffsetsC = dyn_cast<Constant>(biasOffsets.getNode());
+    // Quantize bias channelwise.
+    biasCQ->getPayloadMutable() = quantization::quantizeTensor(
+        biasC->getPayload(), biasScalesC->getPayload(),
+        biasOffsetsC->getPayload(), biasElemQTy, qDim, qStep);
+    bias = NodeValue(biasCQ);
+  }
 
-  DCHECK(dyn_cast<Constant>(offsets.getNode()))
-      << "offsets input to ChannelwiseQuantizedConvolutionNode must be a"
-         "Constant";
-
+  auto OT = getParent()->uniqueType(*outTy);
   return addNode(new ChannelwiseQuantizedConvolutionNode(
-      name, OT, input, filter, bias, scales, offsets, kernels, strides, pads,
-      group));
+      name, OT, input, filter, bias, filterScales, filterOffsets, biasScales,
+      biasOffsets, kernels, strides, pads, group, dilation));
 }
 
 ConvTransposeNode *Function::createConvTranspose(
@@ -4403,15 +4584,20 @@ void Function::dump() const {
   }
 }
 
-std::string Function::toString(bool skipUsersForStorage) const {
+std::string Function::toString(bool skipUsersForStorage, bool skipName) const {
   std::string storage;
   llvm::raw_string_ostream os(storage);
-  dump(os, skipUsersForStorage);
+  dump(os, skipUsersForStorage, skipName);
   return os.str();
 }
 
-void Function::dump(llvm::raw_ostream &os, bool skipUsersForStorage) const {
-  os << "Graph structure " << getName() << ":\n";
+void Function::dump(llvm::raw_ostream &os, bool skipUsersForStorage,
+                    bool skipName) const {
+  os << "Graph structure";
+  if (!skipName) {
+    os << " " << getName();
+  }
+  os << ":\n";
   std::set<const Node *, SortNamed> sorted;
   for (const Node &n : nodes_) {
     sorted.insert(&n);
@@ -4519,7 +4705,7 @@ NodeValue Function::getNodeValueByName(llvm::StringRef name) {
   auto nodeName = strPair.first;
   Node *node = getNodeByName(nodeName);
   node = node ? node : getParent()->getConstantByName(nodeName);
-  node = node ? node : getParent()->getPlaceholderByName(nodeName);
+  node = node ? node : getParent()->getPlaceholderByNameSlow(nodeName);
   if (!node || (node->getNumResults() == 0)) {
     return NodeValue();
   }
@@ -4566,7 +4752,7 @@ Constant *Module::getConstantByName(llvm::StringRef name) const {
   return nullptr;
 }
 
-Placeholder *Module::getPlaceholderByName(llvm::StringRef name) const {
+Placeholder *Module::getPlaceholderByNameSlow(llvm::StringRef name) const {
   for (auto *P : getPlaceholders()) {
     if (P->getName() == name) {
       return P;

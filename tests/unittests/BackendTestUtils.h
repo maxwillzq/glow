@@ -156,12 +156,15 @@ public:
 protected:
   void checkNumericalEquivalence(float allowedError = 0.0001) {
     // Check that the function and its optimized complement exist.
-    EXPECT_TRUE(F_);
-    EXPECT_TRUE(optimizedF_);
+    ASSERT_TRUE(F_);
+    ASSERT_TRUE(optimizedF_);
 
     // Check that the bindings are not empty. If they are, the numerical
     // equivalence check can produce a false positive.
     EXPECT_GT(bindings_.getDataSize(), 0);
+
+    // Allocate any leftover PHs; these are usually for SaveNodes.
+    bindings_.allocate(mod_.getPlaceholders());
 
     // Clone bindings to use for original and optimized functions.
     PlaceholderBindings originalBindings = bindings_.clone();
@@ -318,14 +321,16 @@ using CreateAndInitFunction =
 /// the Function inside itself, so that testing can be done on architectures
 /// that have parallel compute engines. The bias is quantized using the
 /// precision \p biasElemKind. \p forceFP16AccumSLS is propagated into the
-/// precision config for compilation.
+/// precision config for compilation. If \p convertToChannelwiseQuantization
+/// is enabled then nodes supporting channelwise quantization will be converted.
 void compareAgainstInterpreter(
     llvm::StringRef backendName, CreateAndInitFunction createAndInitFunction,
     ElemKind interpElemKind, ElemKind backendElemKind,
     float allowedError = 0.0001, unsigned parallelCount = 1,
     bool convertToRowwiseQuantization = false,
     quantization::Schema schema = quantization::Schema::Asymmetric,
-    ElemKind biasElemKind = ElemKind::Int32QTy, bool forceFP16AccumSLS = false);
+    ElemKind biasElemKind = ElemKind::Int32QTy, bool forceFP16AccumSLS = false,
+    bool convertToChannelwiseQuantization = false);
 
 /// Given some \p FTP representing a Function with a single SaveNode and its
 /// Tensor output, duplicate the Nodes in the Function and their Placeholder

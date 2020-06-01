@@ -63,6 +63,8 @@ public:
 
   TypeRef getType() const { return Ty_; }
 
+  void setType(TypeRef Ty) { Ty_ = Ty; }
+
   llvm::ArrayRef<dim_t> dims() const { return Ty_->dims(); }
 
   size_t size() const { return Ty_->size(); }
@@ -113,6 +115,13 @@ public:
 };
 
 using KindSet = llvm::SmallSet<Kinded::Kind, 4>;
+
+/// Subclasses of this class represent an IR container, e.g. a function or a
+/// module.
+class IRContainer : public Named {
+public:
+  IRContainer(llvm::StringRef name) : Named(name) {}
+};
 
 } // namespace glow
 
